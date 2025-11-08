@@ -1,0 +1,198 @@
+With material_requirement_sch as (
+SELECT
+    jo.job_order_sk,
+    jo.job_order_id,
+    jo.entity_sk AS job_entity_sk,
+    jo.start_time AS job_order_start_time,
+    jo.end_time AS job_order_end_time,
+    jo.entity_type, 
+    jo.work_master_id,
+    wr.work_request_sk,
+    wr.work_request_id,
+    wr.start_time AS request_start_time,
+    wr.end_time AS request_end_time,
+    ws.work_schedule_sk,
+    ws.work_schedule_id,
+    ws.start_time AS schedule_start_time,
+    ws.end_time AS schedule_end_time,
+    ws.schedule_state,
+	mr.material_requirement_sk,  
+	mr.material_requirement_id,  
+	--mr.entity_type,  
+	mr.entity_sk,  
+	mr.entity_id, 
+	mr.description,  
+	mr.hierarchy_scope, 
+	mr.material_use,  
+	mr.material_class_ids,  
+	mr.material_definition_ids,  
+	mr.material_lot_ids,  
+	mr.parent_assembly_material_requirement_sk,  
+	mr.assembly_material_requirement_path_ids,  
+	mr.assembly_type,  
+	mr.assembly_relationship,  
+	mr.storage_location,  
+	mr.storage_location_type,  
+	mr.spatial_definition_sk,  
+	mr.required_by_request_segment_response,  
+	mr.test_specification_ids,  
+	mr.main_quantity_sk,  
+	mr.main_quantity_key,  
+	mr.main_quantity_value_dec,  
+	mr.main_quantity_uom,  
+	mr.property_count,  
+	mr.record_time, 
+	mr.source_system , 
+	mr.ingestion_reference_sk  
+FROM
+    dw.job_order jo
+LEFT JOIN dw.work_request wr
+    ON jo.entity_sk = wr.work_request_sk
+LEFT JOIN dw.work_schedule ws
+    ON wr.work_schedule_sk= ws.work_schedule_sk
+LEFT JOIN dw.material_requirement mr
+	on jo.job_order_sk =mr.entity_sk
+),
+cross_calendar AS (
+  SELECT 
+    cal.*,
+    wm.wm AS work_master_id
+  FROM datamart.cal_days cal
+  CROSS JOIN (
+    SELECT DISTINCT work_master_id AS wm FROM datamart.job_response
+    UNION 
+    SELECT DISTINCT work_master_id AS wm FROM material_requirement_sch
+  ) wm
+),
+planned AS (
+  SELECT
+    c.date,
+    c.work_master_id,
+    p.work_schedule_id,
+    p.material_use,
+    SUM(
+      COALESCE(qp.value_num, 0) *
+      EXTRACT(EPOCH FROM (LEAST(p.job_order_end_time, c.period_end) - GREATEST(p.job_order_start_time, c.period_start))) /
+      NULLIF(EXTRACT(EPOCH FROM (p.job_order_end_time - p.job_order_start_time)), 0)
+    ) AS planned_quantity
+  FROM cross_calendar c
+  LEFT JOIN material_requirement_sch p
+    ON p.work_master_id = c.work_master_id
+   AND p.job_order_end_time > c.period_start 
+   AND p.job_order_start_time < c.period_end
+  LEFT JOIN datamart.quantity qp 
+    ON qp.parent_datamart_sk = p.entity_sk
+   AND qp.key = CASE 
+      WHEN p.work_master_id = 'Prod Drilling' THEN 'length' 
+      ELSE 'mass'
+    end
+    WHERE p.material_use = CASE 
+        WHEN p.work_master_id IN ('Prod Drilling', 'Prod Charge Up') THEN 'Produced' 
+        ELSE 'Consumed'
+    END
+  GROUP BY c.date, c.work_master_id, p.work_schedule_id,p.material_use
+),
+actual AS (
+  SELECT
+    c.date,
+    c.work_master_id,
+    ma.material_use,
+    SUM(COALESCE(qa.value_num, 0)) AS actual_quantity
+  FROM cross_calendar c
+  JOIN datamart.job_response a
+    ON a.work_master_id = c.work_master_id
+   AND a.end_time >= c.period_start
+   AND a.end_time < c.period_end
+  JOIN datamart.material_actual ma
+    ON ma.parent_datamart_sk = a.datamart_sk
+  JOIN datamart.quantity qa
+    ON qa.parent_datamart_sk = ma.datamart_sk
+   AND qa.key = CASE 
+      WHEN a.work_master_id = 'Prod Drilling' THEN 'totalmetercount' 
+      WHEN a.work_master_id = 'Prod Charge Up' THEN 'total_anfo' 
+      ELSE 'mass'
+  END
+  WHERE ma.material_use = CASE 
+        WHEN a.work_master_id IN ('Prod Drilling', 'Prod Charge Up') THEN 'Produced' 
+        ELSE 'Consumed'
+    END
+  GROUP BY c.date, c.work_master_id,ma.material_use
+),
+joined AS (
+  SELECT 
+    c.date,
+    MIN(c.period_start) AS period_start,
+    MAX(c.period_end) AS period_end,
+    c.work_master_id,
+    COALESCE(a.material_use, p.material_use) AS material_use,
+    p.work_schedule_id,
+    SUM(COALESCE(p.planned_quantity, 0)) AS planned_quantity,
+    SUM(COALESCE(a.actual_quantity, 0)) AS actual_quantity
+  FROM cross_calendar c
+  LEFT JOIN planned p
+    ON p.date = c.date AND p.work_master_id = c.work_master_id
+  LEFT JOIN actual a
+    ON a.date = c.date AND a.work_master_id = c.work_master_id
+  GROUP BY c.date, c.work_master_id, p.work_schedule_id, COALESCE(a.material_use, p.material_use)
+)
+SELECT *,
+  -- Running totals
+  SUM(planned_quantity) OVER (
+    PARTITION BY work_master_id
+    ORDER BY date
+    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+  ) AS running_planned_quantity,
+  SUM(actual_quantity) OVER (
+    PARTITION BY work_master_id
+    ORDER BY date
+    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+  ) AS running_actual_quantity,
+  -- Variance columns
+  (actual_quantity - planned_quantity) AS variance, 
+  (SUM(actual_quantity) OVER (
+    PARTITION BY work_master_id
+    ORDER BY date
+    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+   ) 
+   - 
+   SUM(planned_quantity) OVER (
+    PARTITION BY work_master_id
+    ORDER BY date
+    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+   )
+  ) AS running_sum_variance,
+   CASE 
+    WHEN (actual_quantity - planned_quantity) > 0 THEN 'Actual (Above planned)'
+    WHEN (actual_quantity - planned_quantity) < 0 THEN 'Actual (Below planned)'
+    ELSE 'Actual (On target)'
+  END AS variance_color,
+  CASE 
+    WHEN (
+      SUM(actual_quantity) OVER (
+        PARTITION BY work_master_id
+        ORDER BY date
+        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+      ) - 
+      SUM(planned_quantity) OVER (
+        PARTITION BY work_master_id
+        ORDER BY date
+        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+      )
+    ) > 0 THEN 'Actual (Above planned)'
+    WHEN (
+      SUM(actual_quantity) OVER (
+        PARTITION BY work_master_id
+        ORDER BY date
+        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+      ) - 
+      SUM(planned_quantity) OVER (
+        PARTITION BY work_master_id
+        ORDER BY date
+        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+      )
+    ) < 0 THEN 'Actual (Below planned)'
+    ELSE 'Actual (On target)'
+  END AS runnig_variance_color
+FROM joined
+where date > '2024-12-30'
+ORDER BY date, work_master_id, work_schedule_id
