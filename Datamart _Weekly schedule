@@ -1,0 +1,151 @@
+WITH material_requirement_sch AS (
+  SELECT
+    mr.datamart_sk,
+    mr.entity_type,
+    mr.material_requirement_sk,
+    mr.parent_entity_type,
+    mr.parent_entity_sk,
+    mr.parent_datamart_sk,
+    mr.root_entity_type,
+    mr.root_entity_sk,
+    mr.root_datamart_sk,
+    mr.last_update_time,
+    mr.source_system,
+    mr.ingestion_reference_sk,
+    mr.parent_material_requirement_sk,
+    mr.material_requirement_id,
+    mr.description,
+    mr.hierarchy_scope,
+    mr.hierarchy_scope_path,
+    mr.material_use,
+    mr.material_class_id,
+    mr.material_definition_id,
+    mr.material_lot_id,
+    mr.assembly_type,
+    mr.assembly_relationship,
+    mr.storage_location,
+    mr.storage_location_type,
+    mr.required_by_request_segment_response,
+    mr.test_specification_id,
+    mr.schedule_type,
+    mr.schedule_id,
+    mr.schedule_work_type,
+    mr.schedule_start_time,
+    mr.schedule_end_time,
+    mr.schedule_state,
+    mr.request_id,
+    mr.request_start_time,
+    mr.request_end_time,
+    mr.order_id,
+    mr.order_start_time,
+    mr.order_end_time,
+    mr.work_master_id,
+    mr.mass,
+    mr.au_mass,
+    mr.au_gpt,
+    mr.total_prod_drill_meters,
+    mr.progression_meters,
+    ws.record_time
+  FROM datamart.material_requirement mr
+  LEFT JOIN datamart.job_order jo 
+    ON mr.parent_entity_sk = jo.job_order_sk
+  LEFT JOIN datamart.work_request wr 
+    ON jo.parent_entity_sk = wr.work_request_sk
+  LEFT JOIN datamart.work_schedule ws 
+    ON wr.parent_entity_sk = ws.work_schedule_sk  
+),
+cross_calendar AS (
+  SELECT 
+    cal.*,
+    wm.wm AS work_master_id
+  FROM datamart.cal_days cal
+  CROSS JOIN (
+    SELECT DISTINCT work_master_id AS wm FROM datamart.job_response
+    UNION 
+    SELECT DISTINCT work_master_id AS wm FROM material_requirement_sch
+  ) wm
+)
+  /* 1) Default: mass-based planning */
+  SELECT
+    c.date,
+    c.work_master_id,
+    p.schedule_id,
+    p.material_use,
+    p.material_definition_id,
+    SUM(
+      COALESCE(p.mass, 0) *
+      EXTRACT(EPOCH FROM (LEAST(p.order_end_time, c.period_end) - GREATEST(p.order_start_time, c.period_start))) /
+      NULLIF(EXTRACT(EPOCH FROM (p.order_end_time - p.order_start_time)), 0)
+    ) AS planned_quantity,
+    't'::text AS uom            -- << set UoM for mass
+  FROM cross_calendar c
+  JOIN material_requirement_sch p
+    ON p.work_master_id = c.work_master_id
+   AND p.order_end_time   > c.period_start
+   AND p.order_start_time < c.period_end
+  WHERE c.work_master_id NOT IN ('Prod Drilling', 'Development')
+  GROUP BY c.date, c.work_master_id, p.schedule_id, p.material_use, p.material_definition_id
+  UNION ALL
+  /* 1b) Au Grade */
+  SELECT
+    c.date,
+    c.work_master_id,
+    p.schedule_id,
+    p.material_use,
+    p.material_definition_id,
+    SUM(
+      COALESCE(p.au_gpt, 0) *
+      EXTRACT(EPOCH FROM (LEAST(p.order_end_time, c.period_end) - GREATEST(p.order_start_time, c.period_start))) /
+      NULLIF(EXTRACT(EPOCH FROM (p.order_end_time - p.order_start_time)), 0)
+    ) AS planned_quantity,
+    'g/t'::text AS uom          -- << set UoM for grade (e.g., g/t or gpt)
+  FROM cross_calendar c
+  JOIN material_requirement_sch p
+    ON p.work_master_id = c.work_master_id
+   AND p.order_end_time   > c.period_start
+   AND p.order_start_time < c.period_end
+  WHERE c.work_master_id NOT IN ('Prod Drilling', 'Development')
+  GROUP BY c.date, c.work_master_id, p.schedule_id, p.material_use, p.material_definition_id
+  UNION ALL
+  /* 2) Prod Drilling: use total_prod_drill_meters */
+  SELECT
+    c.date,
+    c.work_master_id,
+    p.schedule_id,
+    p.material_use,
+    p.material_definition_id,
+    SUM(
+      COALESCE(p.total_prod_drill_meters, 0) *
+      EXTRACT(EPOCH FROM (LEAST(p.order_end_time, c.period_end) - GREATEST(p.order_start_time, c.period_start))) /
+      NULLIF(EXTRACT(EPOCH FROM (p.order_end_time - p.order_start_time)), 0)
+    ) AS planned_quantity,
+    'm'::text AS uom            -- << set UoM s
+  FROM cross_calendar c
+  JOIN material_requirement_sch p
+    ON p.work_master_id = c.work_master_id
+   AND p.order_end_time   > c.period_start
+   AND p.order_start_time < c.period_end
+ -- WHERE c.work_master_id = 'Prod Drilling'
+  GROUP BY c.date, c.work_master_id, p.schedule_id, p.material_use, p.material_definition_id
+  UNION ALL
+  /* 3) progression_meters */
+  SELECT
+    c.date,
+    c.work_master_id,
+    p.schedule_id,
+    p.material_use,
+    p.material_definition_id,
+    SUM(
+      COALESCE(p.progression_meters, 0) *
+      EXTRACT(EPOCH FROM (LEAST(p.order_end_time, c.period_end) - GREATEST(p.order_start_time, c.period_start))) /
+      NULLIF(EXTRACT(EPOCH FROM (p.order_end_time - p.order_start_time)), 0)
+    ) AS planned_quantity,
+    'm'::text AS uom            -- << set UoM 
+  FROM cross_calendar c
+  JOIN material_requirement_sch p
+    ON p.work_master_id = c.work_master_id
+   AND p.order_end_time   > c.period_start
+   AND p.order_start_time < c.period_end
+ -- WHERE c.work_master_id in ('Dev')
+  GROUP BY c.date, c.work_master_id, p.schedule_id, p.material_use, p.material_definition_id
+  
