@@ -1,0 +1,73 @@
+WITH cal AS (
+    SELECT  
+        period_start AT TIME ZONE 'Australia/Perth' AT TIME ZONE 'UTC' AS period_start,
+        period_end AT TIME ZONE 'Australia/Perth' AT TIME ZONE 'UTC' AS period_end,
+        year,
+        month,
+        date
+    FROM datamart.cal_days
+    WHERE year = EXTRACT(YEAR FROM CURRENT_DATE)
+),
+equipment_counts AS (
+    SELECT
+        parent_entity_sk AS job_order_sk,
+        SUM(CASE WHEN equipment_class_id = 'Haul Truck' THEN 1 ELSE 0 END) AS haul_truck_count,
+        SUM(CASE WHEN equipment_class_id = 'Bogger' THEN 1 ELSE 0 END) AS bogger_count
+    FROM datamart.equipment_requirement
+    GROUP BY parent_entity_sk
+),
+personnel_counts AS (
+    SELECT
+        parent_entity_sk AS job_order_sk,
+        SUM(CASE WHEN personnel_class_id = 'Haul Truck Operator' THEN 1 ELSE 0 END) AS haul_truck_operator_count,
+        SUM(CASE WHEN personnel_class_id = 'Bogger Operator' THEN 1 ELSE 0 END) AS bogger_operator_count
+    FROM datamart.personnel_requirement
+    GROUP BY parent_entity_sk
+),
+job_order AS (
+    SELECT
+        JO.entity_type AS WS_entity_type,
+        JO.job_order_id AS WS_job_response_sk,
+        JO.last_update_time AS WS_last_update_time,
+        JO.source_system AS WS_source_system,
+        JO.job_order_id AS WS_job_response_id,
+        JO.start_time AS WS_start_time,
+        JO.end_time AS WS_end_time,
+        JO.job_order_id AS WS_job_order_id,
+        JO.work_master_id AS WS_work_master_id,
+        JO.work_schedule_id,
+        JO.work_request_id,
+        JO.work_request_start_time,
+        JO.work_request_end_time,
+        JO.work_schedule_start_time AS schedule_start_time,
+        JO.work_schedule_end_time AS schedule_end_time,
+        JO.work_schedule_state,
+        NULLIF(JO.source_hierarchy_scope_path, '') AS WS_source_hierarchy_scope_path,
+        NULLIF(JO.dest_hierarchy_scope_path, '') AS WS_dest_hierarchy_scope_path,
+        JO.source_material_lot_id AS WS_source_material_lot_id,
+        JO.source_material_definition_id AS WS_source_material_definition_id,
+        JO.dest_material_lot_id AS WS_dest_material_lot_id,
+        JO.dest_material_definition_id AS WS_dest_material_definition_id,
+        JO.mass AS WS_mass,
+        ec.haul_truck_count,
+        ec.bogger_count,
+        pc.haul_truck_operator_count,
+        pc.bogger_operator_count,
+        -- Compliance Checks
+    CASE 
+        WHEN JO.source_material_lot_id ~ '.*_[0-9]{3,10}$' THEN 1
+        ELSE 0 END AS ws_source_material_lot_id_non_compliant,
+    CASE 
+        WHEN JO.dest_material_lot_id ~ '.*_[0-9]{3,10}$' THEN 1
+        ELSE 0 END AS ws_dest_material_lot_id_non_compliant
+    FROM datamart.job_order JO
+    LEFT JOIN equipment_counts ec
+        ON ec.job_order_sk = JO.job_order_sk
+    LEFT JOIN personnel_counts pc 
+        ON pc.job_order_sk = JO.job_order_sk
+)
+SELECT 
+    *
+FROM cal c
+LEFT JOIN job_order j
+    ON j.WS_end_time >= c.period_start AND j.WS_end_time < c.period_end
