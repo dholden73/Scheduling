@@ -1,0 +1,60 @@
+select 
+mr.datamart_sk,
+mr.entity_type,
+mr.material_requirement_sk,
+mr.parent_entity_type,
+mr.parent_entity_sk,
+mr.parent_datamart_sk,
+mr.root_entity_type,
+mr.root_entity_sk,
+mr.root_datamart_sk,
+mr.last_update_time,
+mr.source_system,
+mr.ingestion_reference_sk,
+mr.parent_material_requirement_sk,
+mr.material_requirement_id,
+mr.description,
+mr.hierarchy_scope,
+mr.hierarchy_scope_path,
+mr.material_use,
+mr.material_class_id,
+mr.material_definition_id,
+mr.material_lot_id,
+mr.assembly_type,
+mr.assembly_relationship,
+mr.storage_location,
+mr.storage_location_type,
+mr.required_by_request_segment_response,
+mr.test_specification_id,
+mr.schedule_type,
+mr.schedule_id,
+mr.schedule_work_type,
+mr.schedule_start_time,
+mr.schedule_end_time,
+mr.schedule_state,
+mr.request_id,
+mr.request_start_time,
+mr.request_end_time,
+mr.order_id,
+mr.order_start_time,
+mr.order_end_time,
+mr.work_master_id,
+mr.mass,
+mr.au_mass,
+mr.au_gpt,
+mr.total_prod_drill_meters,
+mr.progression_meters,
+ws.record_time,
+CASE 
+  WHEN mr.material_lot_id ~ '.*_[0-9]{3,10}$' THEN 1
+  ELSE 0
+END AS Material_lot_id_has_errors 
+FROM datamart.material_requirement mr
+LEFT JOIN datamart.job_order jo 
+  ON mr.parent_entity_sk = jo.job_order_sk
+LEFT JOIN datamart.work_request wr 
+  ON jo.parent_entity_sk = wr.work_request_sk
+LEFT JOIN datamart.work_schedule ws 
+  ON wr.parent_entity_sk = ws.work_schedule_sk
+  
+  
