@@ -1,0 +1,412 @@
+WITH MR_base AS (
+    SELECT
+        mr.datamart_sk,
+        mr.entity_type,
+        mr.material_requirement_sk,
+        mr.parent_entity_type,
+        mr.parent_entity_sk,
+        mr.parent_datamart_sk,
+        mr.root_entity_type,
+        mr.root_entity_sk,
+        mr.root_datamart_sk,
+        mr.last_update_time,
+        mr.source_system,
+        mr.ingestion_reference_sk,
+        mr.parent_material_requirement_sk,
+        mr.material_requirement_id,
+        mr.description,
+        mr.hierarchy_scope,
+        mr.hierarchy_scope_path,
+        mr.material_use,
+        mr.material_class_id,
+        mr.material_definition_id,
+        mr.material_lot_id,
+        mr.assembly_type,
+        mr.assembly_relationship,
+        mr.storage_location,
+        mr.storage_location_type,
+        mr.required_by_request_segment_response,
+        mr.test_specification_id,
+        mr.schedule_type,
+        mr.schedule_id,
+        mr.schedule_work_type,
+        mr.schedule_start_time,
+        mr.schedule_end_time,
+        mr.schedule_state,
+        mr.request_id,
+        mr.request_start_time,
+        mr.request_end_time,
+        mr.order_id,
+        mr.order_start_time,
+        mr.order_end_time,
+        mr.work_master_id,
+        mr.mass,
+        ws.record_time
+    FROM datamart.material_requirement mr
+    LEFT JOIN datamart.job_order jo
+      ON mr.parent_entity_sk = jo.job_order_sk
+    LEFT JOIN datamart.work_request wr
+      ON jo.parent_entity_sk = wr.work_request_sk
+    LEFT JOIN datamart.work_schedule ws
+      ON wr.parent_entity_sk = ws.work_schedule_sk
+    WHERE mr.schedule_start_time >= current_date - interval '60 days'
+),
+MR_consumed AS (
+    SELECT *
+    FROM MR_base
+    WHERE material_use = 'Consumed'
+),
+MR_produced AS (
+    SELECT *
+    FROM MR_base
+    WHERE material_use = 'Produced'
+),
+DM_MR AS (
+    SELECT
+        p.parent_entity_sk,
+        p.datamart_sk,
+        p.entity_type,
+        p.material_requirement_sk AS dest_material_requirement_sk,
+        c.material_requirement_sk AS source_material_requirement_sk,
+        p.parent_entity_type,
+        p.parent_datamart_sk,
+        p.root_entity_type,
+        p.root_entity_sk,
+        p.root_datamart_sk,
+        p.last_update_time,
+        p.source_system,
+        p.ingestion_reference_sk,
+        p.parent_material_requirement_sk,
+        p.material_requirement_id,
+        p.description,
+        p.request_id,
+        p.schedule_id,
+        p.schedule_work_type,
+        p.schedule_start_time,
+        p.schedule_end_time,
+        p.schedule_state,
+        p.order_id,
+        p.order_start_time,
+        p.order_end_time,
+        p.work_master_id,
+        p.record_time,
+        -- Source
+        c.material_lot_id AS source_material_lot_id,
+        c.material_definition_id AS source_material_definition_id,
+        c.material_class_id AS source_material_class_id,
+        c.storage_location AS source_storage_location,
+        c.storage_location_type AS source_storage_location_type,
+        c.hierarchy_scope AS source_hierarchy_scope,
+        c.hierarchy_scope_path AS source_hierarchy_scope_path,
+        c.mass AS source_mass,
+        -- Destination
+        p.material_lot_id AS dest_material_lot_id,
+        p.material_definition_id AS dest_material_definition_id,
+        p.material_class_id AS dest_material_class_id,
+        p.storage_location AS dest_storage_location,
+        p.storage_location_type AS dest_storage_location_type,
+        p.hierarchy_scope AS dest_hierarchy_scope,
+        p.hierarchy_scope_path AS dest_hierarchy_scope_path,
+        p.mass AS dest_mass
+    FROM MR_produced p
+    INNER JOIN MR_consumed c
+      ON c.parent_entity_sk = p.parent_entity_sk
+),
+MR_props AS (
+    SELECT
+        entity_sk,
+        id,
+        value
+    FROM dw.property
+    WHERE property_type = 'OpMaterialRequirementPropertyType'
+),
+DM_MR_Properties AS MATERIALIZED (
+    SELECT
+        ws.parent_entity_sk,
+        ws.datamart_sk,
+        ws.entity_type,
+        ws.dest_material_requirement_sk,
+        ws.source_material_requirement_sk,
+        ws.parent_entity_type,
+        ws.parent_datamart_sk,
+        ws.root_entity_type,
+        ws.root_entity_sk,
+        ws.root_datamart_sk,
+        ws.last_update_time,
+        ws.source_system,
+        ws.ingestion_reference_sk,
+        ws.parent_material_requirement_sk,
+        ws.material_requirement_id,
+        ws.description,
+        ws.request_id,
+        ws.schedule_id,
+        ws.schedule_work_type,
+        ws.schedule_start_time,
+        ws.schedule_end_time,
+        ws.schedule_state,
+        ws.order_id,
+        ws.order_start_time,
+        ws.order_end_time,
+        ws.work_master_id,
+        ws.record_time,
+        ws.source_material_lot_id,
+        ws.source_material_definition_id,
+        ws.source_material_class_id,
+        ws.source_storage_location,
+        ws.source_storage_location_type,
+        ws.source_hierarchy_scope,
+        ws.source_hierarchy_scope_path,
+        ws.source_mass,
+        ws.dest_material_lot_id,
+        ws.dest_material_definition_id,
+        ws.dest_material_class_id,
+        ws.dest_storage_location,
+        ws.dest_storage_location_type,
+        ws.dest_hierarchy_scope,
+        ws.dest_hierarchy_scope_path,
+        ws.dest_mass,
+        au_c.value::numeric AS source_au_gpt,
+        CASE
+            WHEN NULLIF(trim(dev_c.value), '') IS NOT NULL AND trim(dev_c.value) ~ '^-?\d+(\.\d+)?$' THEN 'DEV'
+            WHEN NULLIF(trim(sto_c.value), '') IS NOT NULL AND trim(sto_c.value) ~ '^-?\d+(\.\d+)?$' THEN 'STO'
+            ELSE NULL
+        END AS contributor,
+        CASE
+            WHEN NULLIF(trim(dev_c.value), '') IS NOT NULL AND trim(dev_c.value) ~ '^-?\d+(\.\d+)?$' THEN dev_c.value::numeric
+            WHEN NULLIF(trim(sto_c.value), '') IS NOT NULL AND trim(sto_c.value) ~ '^-?\d+(\.\d+)?$' THEN sto_c.value::numeric
+            ELSE NULL
+        END AS contributor_value
+    FROM DM_MR ws
+    LEFT JOIN MR_props au_c
+      ON au_c.entity_sk = ws.source_material_requirement_sk AND au_c.id ILIKE '%gpt%'
+    LEFT JOIN MR_props dev_c
+      ON dev_c.entity_sk = ws.source_material_requirement_sk AND dev_c.id ILIKE 'DEV'
+    LEFT JOIN MR_props sto_c
+      ON sto_c.entity_sk = ws.source_material_requirement_sk AND sto_c.id ILIKE 'STO'
+),
+schedule_anchor AS (
+  SELECT DISTINCT ON (ws.schedule_start_time)
+      ws.schedule_start_time,
+      ws.schedule_id,
+      ws.record_time
+  FROM DM_MR_Properties ws
+  WHERE ws.schedule_id ILIKE 'W%'
+    AND ws.record_time IS NOT NULL
+  ORDER BY ws.schedule_start_time, ws.record_time ASC, ws.schedule_id
+),
+planned AS (
+    select
+        ws.parent_entity_sk,
+        'Planned'::text AS execution, 
+        ws.dest_material_requirement_sk,
+        ws.source_material_requirement_sk,
+        ws.last_update_time,
+        ws.source_system,
+        ws.ingestion_reference_sk,
+        ws.parent_material_requirement_sk,
+        ws.material_requirement_id,
+        ws.description,
+        ws.schedule_id AS schedule_id,
+        ws.schedule_work_type,
+        ws.schedule_start_time,
+        ws.schedule_end_time,
+        ws.schedule_state,
+        ws.request_id,
+        ws.order_id,
+        -- job order step number (e.g. "...2903.10" -> 10)
+        NULLIF(regexp_replace(ws.order_id, '.*\.(\d+)$', '\1'), ws.order_id)::int AS order_step_no,
+        ws.order_start_time,
+        ws.order_end_time,
+        ws.work_master_id,
+        ws.record_time,
+        ws.source_material_lot_id,
+        ws.source_material_definition_id,
+        ws.source_material_class_id,
+        ws.source_storage_location,
+        ws.source_storage_location_type,
+        ws.source_hierarchy_scope,
+        ws.source_hierarchy_scope_path,
+        ws.source_mass,
+        ws.dest_material_lot_id,
+        ws.dest_material_definition_id,
+        ws.dest_material_class_id,
+        ws.dest_storage_location,
+        ws.dest_storage_location_type,
+        ws.dest_hierarchy_scope,
+        ws.dest_hierarchy_scope_path,
+        ws.dest_mass,
+        ws.source_au_gpt,
+        ws.contributor,
+        ws.contributor_value
+    FROM DM_MR_Properties ws
+    join schedule_anchor a
+    ON a.schedule_start_time = ws.schedule_start_time
+    AND a.schedule_id = ws.schedule_id
+),
+actuals AS (
+    SELECT
+        jr.job_order_id,
+        jr.work_master_id,
+        SUM(jr.mass) AS tonnes,
+        AVG(ml.au_gpt) AS au_gpt,  -- NOTE: this is simple average; change to weighted if needed
+        SUM(jr.mass * ml.au_gpt) AS au_mass_grams,
+        MIN(
+          CASE
+            WHEN jr.start_time IN ('infinity'::timestamp, '-infinity'::timestamp) THEN NULL
+            ELSE jr.start_time
+          END
+        ) AS start_time,
+        MAX(jr.end_time) AS end_time
+    FROM datamart.job_response jr
+    LEFT JOIN LATERAL (
+        SELECT
+            ml.au_gpt,
+            ml.au_mass
+        FROM datamart.material_lot ml
+        WHERE ml.material_lot_id = jr.source_material_lot_id
+          AND ml.effective_from_time <= jr.end_time
+          AND (ml.effective_to_time IS NULL OR ml.effective_to_time > jr.end_time)
+        ORDER BY ml.effective_from_time DESC  
+        LIMIT 1
+    ) ml ON TRUE
+    GROUP BY
+        jr.job_order_id,
+        jr.work_master_id
+),
+planned_rows as (
+SELECT
+  ws.*,
+  a.tonnes AS actual_tonnes,
+  a.au_gpt AS actual_au_gpt,
+  a.au_mass_grams AS actual_au_mass_grams,
+  a.start_time AS actual_start_time,
+  a.end_time AS actual_end_time
+FROM planned ws
+left JOIN actuals a
+  ON ws.order_id = a.job_order_id
+),
+schedule_weeks AS (
+  SELECT DISTINCT
+    schedule_id,
+    schedule_start_time,
+    schedule_end_time
+  FROM planned
+),
+---Executed jobs not attached to WS
+unplanned AS (
+    SELECT
+        ws.parent_entity_sk,
+        'Unplanned'::text AS execution, 
+        ws.dest_material_requirement_sk,
+        ws.source_material_requirement_sk,
+        ws.last_update_time,
+        ws.source_system,
+        ws.ingestion_reference_sk,
+        ws.parent_material_requirement_sk,
+        ws.material_requirement_id,
+        ws.description,
+        ws.schedule_id AS schedule_id,
+        ws.schedule_work_type,
+        ws.schedule_start_time,
+        ws.schedule_end_time,
+        ws.schedule_state,
+        ws.request_id,
+        ws.order_id,
+        -- job order step number (e.g. "...2903.10" -> 10)
+        NULLIF(regexp_replace(ws.order_id, '.*\.(\d+)$', '\1'), ws.order_id)::int AS order_step_no,
+        ws.order_start_time,
+        ws.order_end_time,
+        ws.work_master_id,
+        ws.record_time,
+        ws.source_material_lot_id,
+        ws.source_material_definition_id,
+        ws.source_material_class_id,
+        ws.source_storage_location,
+        ws.source_storage_location_type,
+        ws.source_hierarchy_scope,
+        ws.source_hierarchy_scope_path,
+        ws.source_mass,
+        ws.dest_material_lot_id,
+        ws.dest_material_definition_id,
+        ws.dest_material_class_id,
+        ws.dest_storage_location,
+        ws.dest_storage_location_type,
+        ws.dest_hierarchy_scope,
+        ws.dest_hierarchy_scope_path,
+        ws.dest_mass,
+        ws.source_au_gpt,
+        ws.contributor,
+        ws.contributor_value
+    FROM DM_MR_Properties ws
+),
+unplanned_rows AS (
+    SELECT
+	    NULL::uuid AS parent_entity_sk,
+    'Unplanned'::text AS execution,
+    NULL::uuid AS dest_material_requirement_sk,
+    NULL::uuid AS source_material_requirement_sk,
+    NULL::timestamp AS last_update_time,
+    NULL::text AS source_system,
+    NULL::uuid AS ingestion_reference_sk,
+    NULL::uuid AS parent_material_requirement_sk,
+    NULL::text AS material_requirement_id,
+    NULL::text AS description,
+    sw.schedule_id,
+    NULL::text AS schedule_work_type,
+    sw.schedule_start_time,
+    sw.schedule_end_time,
+    NULL::text AS schedule_state,
+    NULL::text AS request_id,
+    a.job_order_id::text AS order_id,
+    NULL::int AS order_step_no,
+    NULL::timestamp AS order_start_time,
+    NULL::timestamp AS order_end_time,
+    a.work_master_id AS work_master_id,
+    NULL::timestamp AS record_time,
+    NULL::text AS source_material_lot_id,
+    NULL::text AS source_material_definition_id,
+    NULL::text AS source_material_class_id,
+    NULL::text AS source_storage_location,
+    NULL::text AS source_storage_location_type,
+    NULL::text AS source_hierarchy_scope,
+    NULL::text AS source_hierarchy_scope_path,
+    NULL::numeric AS source_mass,
+    NULL::text AS dest_material_lot_id,
+    NULL::text AS dest_material_definition_id,
+    NULL::text AS dest_material_class_id,
+    NULL::text AS dest_storage_location,
+    NULL::text AS dest_storage_location_type,
+    NULL::text AS dest_hierarchy_scope,
+    NULL::text AS dest_hierarchy_scope_path,
+    NULL::numeric AS dest_mass,
+    NULL::numeric AS source_au_gpt,
+    NULL::text AS contributor,
+    NULL::numeric AS contributor_value,  
+    a.tonnes AS actual_tonnes,
+      a.au_gpt AS actual_au_gpt,
+      a.au_mass_grams AS actual_au_mass_grams,
+      a.start_time AS actual_start_time,
+      a.end_time AS actual_end_time
+	FROM schedule_weeks sw
+	JOIN actuals a
+	   ON a.end_time IS NOT NULL
+	   AND a.start_time IS NOT NULL
+	   AND a.start_time <  sw.schedule_end_time
+	   AND a.end_time   >= sw.schedule_start_time
+),
+unioned AS (
+    SELECT * FROM planned_rows
+    UNION ALL
+    SELECT * FROM unplanned_rows
+)
+    SELECT *
+    FROM (
+        SELECT
+          u.*,
+          ROW_NUMBER() OVER (
+            PARTITION BY u.schedule_id, u.work_master_id, u.order_id
+            ORDER BY CASE WHEN u.execution = 'Planned' THEN 1 ELSE 0 END DESC
+          ) AS rn
+        FROM unioned u
+    ) x
+    WHERE x.rn = 1
