@@ -1,0 +1,215 @@
+WITH cross_calendar AS ( 
+  SELECT 
+    cal.*,
+    wm.wm AS work_master_id
+  FROM datamart.cal_prod_days cal
+  CROSS JOIN (
+    SELECT DISTINCT work_master_id AS wm FROM datamart.job_response
+    UNION 
+    SELECT DISTINCT work_master_id AS wm FROM datamart.material_requirement_sch
+  ) wm
+  UNION ALL
+  SELECT 
+    cal.*,
+    'Blasthole Drilling - Tonnes' AS work_master_id
+  FROM datamart.cal_prod_days cal
+  where cal.year=EXTRACT(YEAR FROM <<$ReportingDate>>) and cal.month=EXTRACT(MONTH FROM <<$ReportingDate>>)
+),
+tonnes_drilled_planned AS (
+  SELECT 
+    c.production_day,
+    'Blasthole Drilling - Tonnes' AS work_master_id,
+    p.work_schedule_id,
+    p.material_use,
+    MAX(qp.unit_of_measure) AS planned_uom,
+    SUM(
+      COALESCE(qp.value_num, 0) *
+      EXTRACT(EPOCH FROM (LEAST(p.job_order_end_time, c.period_end) - GREATEST(p.job_order_start_time, c.period_start))) /
+      NULLIF(EXTRACT(EPOCH FROM (p.job_order_end_time - p.job_order_start_time)), 0)
+    ) AS planned_quantity
+  FROM cross_calendar c
+  LEFT JOIN datamart.material_requirement_sch p
+    ON p.work_master_id = 'Blasthole Drilling'
+    AND p.job_order_end_time > c.period_start 
+    AND p.job_order_start_time < c.period_end
+  LEFT JOIN datamart.property qp
+    ON qp.parent_datamart_sk = p.datamart_sk
+    AND qp.property_id = 'tonnesdrilled'
+  GROUP BY c.production_day, p.work_schedule_id, p.material_use
+),
+planned_main AS (
+  SELECT
+    c.production_day,
+    c.work_master_id,
+    p.work_schedule_id,
+    p.material_use,
+    MAX(qp.uom) AS planned_uom,
+    SUM(
+      COALESCE(qp.value_num, 0) *
+      EXTRACT(EPOCH FROM (LEAST(p.job_order_end_time, c.period_end) - GREATEST(p.job_order_start_time, c.period_start))) /
+      NULLIF(EXTRACT(EPOCH FROM (p.job_order_end_time - p.job_order_start_time)), 0)
+    ) AS planned_quantity
+  FROM cross_calendar c
+  LEFT JOIN datamart.material_requirement_sch p
+    ON p.work_master_id = c.work_master_id
+    AND p.job_order_end_time > c.period_start 
+    AND p.job_order_start_time < c.period_end
+  LEFT JOIN datamart.quantity qp
+    ON qp.parent_datamart_sk = p.datamart_sk
+    AND qp.key = CASE 
+      WHEN p.work_master_id = 'Blasthole Drilling' THEN 'totalmetercount' 
+      WHEN p.work_master_id = 'Explosive Loading' THEN 'total_emulsion' 
+      ELSE 'mass'
+    END
+  WHERE 
+    p.material_use IS NOT NULL
+  GROUP BY c.production_day, c.work_master_id, p.work_schedule_id, p.material_use
+),
+planned AS (
+  SELECT * FROM planned_main
+  UNION ALL
+  SELECT * FROM tonnes_drilled_planned
+),
+tonnes_drilled_actual AS (
+  SELECT 
+    c.production_day,
+    'Blasthole Drilling - Tonnes' AS work_master_id,
+    'Produced' AS material_use,
+    MAX(qa.unit_of_measure) AS actual_uom,
+    SUM(COALESCE(qa.value_num, 0)) AS actual_quantity
+  FROM cross_calendar c
+  LEFT JOIN datamart.job_response a
+    ON a.work_master_id = 'Blasthole Drilling'
+    AND a.end_time >= c.period_start
+    AND a.end_time < c.period_end
+  LEFT JOIN datamart.material_actual ma
+    ON ma.parent_datamart_sk = a.datamart_sk
+    AND ma.material_use = 'Produced'
+  LEFT JOIN datamart.property qa
+    ON qa.parent_datamart_sk = ma.datamart_sk
+    AND qa.property_id = 'tonnesdrilled'
+  GROUP BY c.production_day
+),
+actual_main AS ( 
+ SELECT
+    c.production_day,
+    c.work_master_id,
+    COALESCE(ma.material_use, 
+      CASE 
+        WHEN c.work_master_id IN ('Blasthole Drilling', 'Explosive Loading', 'Extraction', 'Prestripping', 'Primary Crushing', 'ROM Rehandling', 'Product Stacking') THEN 'Produced'
+        WHEN c.work_master_id = 'Blasting' THEN 'Consumed'
+        ELSE 'Consumed'
+      END
+    ) AS material_use,
+    MAX(qa.uom) AS actual_uom,
+    SUM(COALESCE(qa.value_num, 0)) AS actual_quantity
+  FROM cross_calendar c
+  LEFT JOIN datamart.job_response a
+    ON a.work_master_id = c.work_master_id
+    AND a.end_time >= c.period_start
+    AND a.end_time < c.period_end
+  LEFT JOIN datamart.material_actual ma
+    ON ma.parent_datamart_sk = a.datamart_sk
+  LEFT JOIN datamart.quantity qa
+    ON qa.parent_datamart_sk = ma.datamart_sk
+    AND qa.key = CASE 
+      WHEN c.work_master_id = 'Blasthole Drilling' THEN 'totalmetercount' 
+      WHEN c.work_master_id = 'Explosive Loading' THEN 'total_anfo' 
+      ELSE 'mass'
+    END
+  WHERE c.work_master_id != 'Blasthole Drilling - Tonnes'
+  GROUP BY 
+    c.production_day,
+    c.work_master_id,
+    COALESCE(ma.material_use, 
+      CASE 
+        WHEN c.work_master_id IN ('Blasthole Drilling', 'Explosive Loading', 'Extraction', 'Prestripping', 'Primary Crushing', 'ROM Rehandling','Product Stacking') THEN 'Produced'
+        WHEN c.work_master_id = 'Blasting' THEN 'Consumed'
+        ELSE 'Consumed'
+      END
+    )
+),
+actual AS (
+  SELECT * FROM actual_main
+  UNION ALL
+  SELECT * FROM tonnes_drilled_actual
+),
+joined AS (
+  SELECT 
+    c.production_day,
+    MIN(c.period_start) AS period_start,
+    MAX(c.period_end) AS period_end,
+    c.work_master_id,
+    COALESCE(a.material_use, p.material_use) AS material_use,
+    p.work_schedule_id,
+    MAX(p.planned_uom) AS planned_uom,
+    MAX(a.actual_uom) AS actual_uom,
+    SUM(COALESCE(p.planned_quantity, 0)) AS planned_quantity,
+    SUM(COALESCE(a.actual_quantity, 0)) AS actual_quantity
+  FROM cross_calendar c
+  LEFT JOIN planned p
+    ON p.production_day = c.production_day 
+    AND p.work_master_id = c.work_master_id
+  LEFT JOIN actual a
+    ON a.production_day = c.production_day 
+    AND a.work_master_id = c.work_master_id
+  GROUP BY c.production_day, c.work_master_id, p.work_schedule_id, COALESCE(a.material_use, p.material_use)
+)
+SELECT *,
+  SUM(planned_quantity) OVER (
+    PARTITION BY work_master_id, material_use
+    ORDER BY production_day
+    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+  ) AS running_planned_quantity,
+  SUM(actual_quantity) OVER (
+    PARTITION BY work_master_id, material_use
+    ORDER BY production_day
+    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+  ) AS running_actual_quantity,
+  (actual_quantity - planned_quantity) AS variance,
+  (
+    SUM(actual_quantity) OVER (
+      PARTITION BY work_master_id, material_use
+      ORDER BY production_day
+      ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    ) - 
+    SUM(planned_quantity) OVER (
+      PARTITION BY work_master_id, material_use
+      ORDER BY production_day
+      ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    )
+  ) AS running_sum_variance,
+  CASE 
+    WHEN (actual_quantity - planned_quantity) > 0 THEN 'Actual (Above planned)'
+    WHEN (actual_quantity - planned_quantity) < 0 THEN 'Actual (Below planned)'
+    ELSE 'Actual (On target)'
+  END AS variance_color,
+  CASE 
+    WHEN (
+      SUM(actual_quantity) OVER (
+        PARTITION BY work_master_id, material_use
+        ORDER BY production_day
+        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+      ) - 
+      SUM(planned_quantity) OVER (
+        PARTITION BY work_master_id, material_use
+        ORDER BY production_day
+        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+      )
+    ) > 0 THEN 'Actual (Above planned)'
+    WHEN (
+      SUM(actual_quantity) OVER (
+        PARTITION BY work_master_id, material_use
+        ORDER BY production_day
+        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+      ) - 
+      SUM(planned_quantity) OVER (
+        PARTITION BY work_master_id, material_use
+        ORDER BY production_day
+        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+      )
+    ) < 0 THEN 'Actual (Below planned)'
+    ELSE 'Actual (On target)'
+  END AS runnig_variance_color
+FROM joined
+ORDER BY production_day, work_master_id, work_schedule_id
