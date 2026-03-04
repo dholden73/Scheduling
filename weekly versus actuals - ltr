@@ -1,159 +1,128 @@
-WITH cross_calendar AS ( 
+WITH material_requirement_sch AS (
+  SELECT
+    mr.material_use,
+    mr.material_class_id,
+    mr.material_definition_id,
+    mr.material_lot_id,
+    mr.storage_location,
+    mr.storage_location_type,
+    mr.schedule_id,
+    mr.order_start_time,
+    mr.order_end_time,
+    mr.schedule_start_time,
+    mr.schedule_end_time,
+    mr.work_master_id,
+    mr.mass,
+    --mr.au_gpt,
+    mr.total_prod_drill_meters,
+    mr.progression_meters
+  FROM datamart.material_requirement mr
+  LEFT JOIN datamart.job_order    jo ON mr.parent_entity_sk = jo.job_order_sk
+  LEFT JOIN datamart.work_request wr ON jo.parent_entity_sk = wr.work_request_sk
+  LEFT JOIN datamart.work_schedule ws ON wr.parent_entity_sk = ws.work_schedule_sk
+  --WHERE mr.schedule_id ILIKE 'W%'
+),
+cross_calendar AS ( 
   SELECT 
     cal.*,
     wm.wm AS work_master_id
   FROM datamart.cal_prod_days cal
   CROSS JOIN (
     SELECT DISTINCT work_master_id AS wm FROM datamart.job_response
-    UNION 
-    SELECT DISTINCT work_master_id AS wm FROM datamart.material_requirement_sch
-  ) wm
-  UNION ALL
-  SELECT 
-    cal.*,
-    'Blasthole Drilling - Tonnes' AS work_master_id
-  FROM datamart.cal_prod_days cal
-  where cal.year=EXTRACT(YEAR FROM <<$ReportingDate>>) and cal.month=EXTRACT(MONTH FROM <<$ReportingDate>>)
 ),
-tonnes_drilled_planned AS (
-  SELECT 
-    c.production_day,
-    'Blasthole Drilling - Tonnes' AS work_master_id,
-    p.work_schedule_id,
-    p.material_use,
-    MAX(qp.unit_of_measure) AS planned_uom,
-    SUM(
-      COALESCE(qp.value_num, 0) *
-      EXTRACT(EPOCH FROM (LEAST(p.job_order_end_time, c.period_end) - GREATEST(p.job_order_start_time, c.period_start))) /
-      NULLIF(EXTRACT(EPOCH FROM (p.job_order_end_time - p.job_order_start_time)), 0)
-    ) AS planned_quantity
-  FROM cross_calendar c
-  LEFT JOIN datamart.material_requirement_sch p
-    ON p.work_master_id = 'Blasthole Drilling'
-    AND p.job_order_end_time > c.period_start 
-    AND p.job_order_start_time < c.period_end
-  LEFT JOIN datamart.property qp
-    ON qp.parent_datamart_sk = p.datamart_sk
-    AND qp.property_id = 'tonnesdrilled'
-  GROUP BY c.production_day, p.work_schedule_id, p.material_use
+plan AS (
+    SELECT       
+        cw.period_start,
+        cw.period_end,
+        cw.year,
+        cw.date,
+        ws.schedule_id,
+        ws.material_definition_id,
+        ws.work_master_id,
+        ws.material_use,
+        --ws.order_start_time,
+        --ws.order_end_time,
+        sum(
+        coalesce(ws.mass,0) *
+            EXTRACT(EPOCH FROM GREATEST(
+                LEAST(ws.order_end_time, cw.period_end) - GREATEST(ws.order_start_time, cw.period_start))) / 
+                NULLIF(EXTRACT(EPOCH FROM (ws.order_end_time - ws.order_start_time)), 0)
+        ) AS plan_mass,
+        sum(
+        coalesce(ws.total_prod_drill_meters,0) *
+            EXTRACT(EPOCH FROM GREATEST(
+                LEAST(ws.order_end_time, cw.period_end) - GREATEST(ws.order_start_time, cw.period_start))) / 
+                NULLIF(EXTRACT(EPOCH FROM (ws.order_end_time - ws.order_start_time)), 0)
+        ) AS plan_total_prod_drill_meters
+        sum(
+        coalesce(ws.progression_meters,0) *
+            EXTRACT(EPOCH FROM GREATEST(
+                LEAST(ws.order_end_time, cw.period_end) - GREATEST(ws.order_start_time, cw.period_start))) / 
+                NULLIF(EXTRACT(EPOCH FROM (ws.order_end_time - ws.order_start_time)), 0)
+        ) AS plan_progression_meters
+	FROM cross_calendar cw
+	LEFT JOIN material_requirement_sch p
+	    ON p.work_master_id = c.work_master_id
+	    AND p.job_order_end_time > c.period_start 
+	    AND p.job_order_start_time < c.period_end 
+	GROUP by
+	c.date, p.work_master_id, p.schedule_id, p.material_use, p.material_definition_id, p.au_gpt,p.order_id
 ),
-planned_main AS (
-  SELECT
-    c.production_day,
-    c.work_master_id,
-    p.work_schedule_id,
-    p.material_use,
-    MAX(qp.uom) AS planned_uom,
-    SUM(
-      COALESCE(qp.value_num, 0) *
-      EXTRACT(EPOCH FROM (LEAST(p.job_order_end_time, c.period_end) - GREATEST(p.job_order_start_time, c.period_start))) /
-      NULLIF(EXTRACT(EPOCH FROM (p.job_order_end_time - p.job_order_start_time)), 0)
-    ) AS planned_quantity
-  FROM cross_calendar c
-  LEFT JOIN datamart.material_requirement_sch p
-    ON p.work_master_id = c.work_master_id
-    AND p.job_order_end_time > c.period_start 
-    AND p.job_order_start_time < c.period_end
-  LEFT JOIN datamart.quantity qp
-    ON qp.parent_datamart_sk = p.datamart_sk
-    AND qp.key = CASE 
-      WHEN p.work_master_id = 'Blasthole Drilling' THEN 'totalmetercount' 
-      WHEN p.work_master_id = 'Explosive Loading' THEN 'total_emulsion' 
-      ELSE 'mass'
-    END
-  WHERE 
-    p.material_use IS NOT NULL
-  GROUP BY c.production_day, c.work_master_id, p.work_schedule_id, p.material_use
-),
-planned AS (
-  SELECT * FROM planned_main
-  UNION ALL
-  SELECT * FROM tonnes_drilled_planned
-),
-tonnes_drilled_actual AS (
-  SELECT 
-    c.production_day,
-    'Blasthole Drilling - Tonnes' AS work_master_id,
-    'Produced' AS material_use,
-    MAX(qa.unit_of_measure) AS actual_uom,
-    SUM(COALESCE(qa.value_num, 0)) AS actual_quantity
-  FROM cross_calendar c
-  LEFT JOIN datamart.job_response a
-    ON a.work_master_id = 'Blasthole Drilling'
-    AND a.end_time >= c.period_start
-    AND a.end_time < c.period_end
-  LEFT JOIN datamart.material_actual ma
-    ON ma.parent_datamart_sk = a.datamart_sk
-    AND ma.material_use = 'Produced'
-  LEFT JOIN datamart.property qa
-    ON qa.parent_datamart_sk = ma.datamart_sk
-    AND qa.property_id = 'tonnesdrilled'
-  GROUP BY c.production_day
-),
-actual_main AS ( 
- SELECT
-    c.production_day,
-    c.work_master_id,
-    COALESCE(ma.material_use, 
-      CASE 
-        WHEN c.work_master_id IN ('Blasthole Drilling', 'Explosive Loading', 'Extraction', 'Prestripping', 'Primary Crushing', 'ROM Rehandling', 'Product Stacking') THEN 'Produced'
-        WHEN c.work_master_id = 'Blasting' THEN 'Consumed'
-        ELSE 'Consumed'
-      END
-    ) AS material_use,
-    MAX(qa.uom) AS actual_uom,
-    SUM(COALESCE(qa.value_num, 0)) AS actual_quantity
-  FROM cross_calendar c
-  LEFT JOIN datamart.job_response a
-    ON a.work_master_id = c.work_master_id
-    AND a.end_time >= c.period_start
-    AND a.end_time < c.period_end
-  LEFT JOIN datamart.material_actual ma
-    ON ma.parent_datamart_sk = a.datamart_sk
-  LEFT JOIN datamart.quantity qa
-    ON qa.parent_datamart_sk = ma.datamart_sk
-    AND qa.key = CASE 
-      WHEN c.work_master_id = 'Blasthole Drilling' THEN 'totalmetercount' 
-      WHEN c.work_master_id = 'Explosive Loading' THEN 'total_anfo' 
-      ELSE 'mass'
-    END
-  WHERE c.work_master_id != 'Blasthole Drilling - Tonnes'
-  GROUP BY 
-    c.production_day,
-    c.work_master_id,
-    COALESCE(ma.material_use, 
-      CASE 
-        WHEN c.work_master_id IN ('Blasthole Drilling', 'Explosive Loading', 'Extraction', 'Prestripping', 'Primary Crushing', 'ROM Rehandling','Product Stacking') THEN 'Produced'
-        WHEN c.work_master_id = 'Blasting' THEN 'Consumed'
-        ELSE 'Consumed'
-      END
-    )
+ranked_plan AS (
+    SELECT *,
+           ROW_NUMBER() OVER (
+               PARTITION BY date, period_start 
+               ORDER BY effective_from_time DESC NULLS LAST
+           ) AS rn
+    FROM plan
 ),
 actual AS (
-  SELECT * FROM actual_main
-  UNION ALL
-  SELECT * FROM tonnes_drilled_actual
+    SELECT       
+	    cw.date,
+	    jr.start_time,
+	    jr.end_time,
+	    jr.work_master_id,
+	    --jr.source_material_lot_id,
+	    jr.source_material_definition_id,
+	    --jr.dest_material_lot_id,
+	    jr.dest_material_definition_id,
+	    --jr.expenditure,
+	    --jr.dev_type,
+	    SUM(COALESCE(jr.mass,0)) as actual_mass,
+	   	SUM(COALESCE(jr.progression_meters,0)) actual_progression_meters,
+	   	SUM(COALESCE(jr.total_prod_drill_meters,0)) as actual_prod_drill_meters,
+	    --jr.distance_travelled,
+	    --jr.distance_hauled
+	from cross_calendar c
+	LEFT JOIN datamart.job_response jr
+	    ON jr.work_master_id = c.work_master_id
+	    AND jr.end_time > c.period_start 
+	    AND jr.start_time < c.period_end 
+	GROUP by
+	c.date, p.work_master_id, p.schedule_id, p.material_use, p.material_definition_id, p.order_id
 ),
 joined AS (
   SELECT 
-    c.production_day,
+    c.date,
     MIN(c.period_start) AS period_start,
     MAX(c.period_end) AS period_end,
     c.work_master_id,
     COALESCE(a.material_use, p.material_use) AS material_use,
     p.work_schedule_id,
-    MAX(p.planned_uom) AS planned_uom,
-    MAX(a.actual_uom) AS actual_uom,
-    SUM(COALESCE(p.planned_quantity, 0)) AS planned_quantity,
-    SUM(COALESCE(a.actual_quantity, 0)) AS actual_quantity
+	a.actual_mass,
+	a.actual_progression_meters,
+	a.actual_prod_drill_meters,
+	p.plan_mass,
+	p.plan_progression_meters,
+	p.plan_prod_drill_meters
   FROM cross_calendar c
-  LEFT JOIN planned p
-    ON p.production_day = c.production_day 
+  LEFT JOIN plan p
+    ON p.date = c.date 
     AND p.work_master_id = c.work_master_id
   LEFT JOIN actual a
-    ON a.production_day = c.production_day 
+    ON a.date = c.date 
     AND a.work_master_id = c.work_master_id
-  GROUP BY c.production_day, c.work_master_id, p.work_schedule_id, COALESCE(a.material_use, p.material_use)
+  GROUP BY c.date, c.work_master_id, p.work_schedule_id, COALESCE(a.material_use, p.material_use)
 )
 SELECT *,
   SUM(planned_quantity) OVER (
