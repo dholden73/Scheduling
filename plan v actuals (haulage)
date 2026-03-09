@@ -1,0 +1,229 @@
+WITH bounds AS (
+    SELECT 
+        MIN(period_start) AS min_time,
+        MAX(period_end)   AS max_time
+    FROM datamart.cal_days
+    WHERE year = 2025
+),
+calendar AS (
+    SELECT 
+        gs.period_start,
+        gs.period_start + INTERVAL '1 hour' AS period_end
+    FROM bounds b
+    JOIN generate_series(b.min_time, b.max_time, INTERVAL '1 hour') AS gs(period_start) ON TRUE
+),
+cal_hourly AS (
+    SELECT 
+        cal.period_start,
+        cal.period_end,
+        d.year,
+        d.month,
+        d.date
+    FROM calendar cal
+    LEFT JOIN datamart.cal_days d
+      ON cal.period_start >= d.period_start 
+     AND cal.period_start <  d.period_end
+),
+work_schedule AS (
+	select 
+		mr.datamart_sk,
+		mr.entity_type,
+		mr.material_requirement_sk,
+		mr.parent_entity_type,
+		mr.parent_entity_sk,
+		mr.parent_datamart_sk,
+		mr.root_entity_type,
+		mr.root_entity_sk,
+		mr.root_datamart_sk,
+		mr.last_update_time,
+		mr.source_system,
+		mr.ingestion_reference_sk,
+		mr.parent_material_requirement_sk,
+		mr.material_requirement_id,
+		mr.description,
+		mr.hierarchy_scope,
+		mr.hierarchy_scope_path,
+		mr.material_use,
+		mr.material_class_id,
+		mr.material_definition_id,
+		mr.material_lot_id,
+		mr.assembly_type,
+		mr.assembly_relationship,
+		mr.storage_location,
+		mr.storage_location_type,
+		mr.required_by_request_segment_response,
+		mr.test_specification_id,
+		mr.schedule_type,
+		mr.schedule_id,
+		mr.schedule_work_type,
+		mr.schedule_start_time,
+		mr.schedule_end_time,
+		mr.schedule_state,
+		mr.request_id,
+		mr.request_start_time,
+		mr.request_end_time,
+		mr.order_id,
+		mr.order_start_time,
+		mr.order_end_time,
+		mr.work_master_id,
+		mr.mass,
+		mr.au_mass,
+		mr.au_gpt,
+		mr.total_prod_drill_meters,
+		mr.progression_meters,
+		ws.record_time,
+		CASE
+			WHEN mr.material_lot_id IS NULL 
+		     	OR mr.material_lot_id ~ '.*_[0-9]{4,}$' THEN 1 else 0
+			END AS Material_lot_id_has_errors 
+FROM datamart.material_requirement mr
+LEFT JOIN datamart.job_order jo 
+  ON mr.parent_entity_sk = jo.job_order_sk
+LEFT JOIN datamart.work_request wr 
+  ON jo.parent_entity_sk = wr.work_request_sk
+LEFT JOIN datamart.work_schedule ws 
+  ON wr.parent_entity_sk = ws.work_schedule_sk
+),
+plan AS (
+    SELECT       
+        cw.period_start,
+        cw.period_end,
+        cw.year,
+        cw.date,
+        ws.schedule_id,
+        ws.request_id,
+        ws.order_id,
+        ws.material_requirement_id,
+        ws.material_lot_id,
+        ws.material_definition_id,
+        ws.work_master_id,
+        ws.material_use,
+        ws.order_start_time,
+        ws.order_end_time,
+        (ws.mass *
+            EXTRACT(EPOCH FROM GREATEST(
+                LEAST(ws.order_end_time, cw.period_end) - 
+                GREATEST(ws.order_start_time, cw.period_start), 
+                INTERVAL '0 seconds'
+            )) / NULLIF(EXTRACT(EPOCH FROM (ws.order_end_time - ws.order_start_time)), 0)
+        ) AS mass,
+        (ws.au_gpt *
+            EXTRACT(EPOCH FROM GREATEST(
+                LEAST(ws.order_end_time, cw.period_end) - 
+                GREATEST(ws.order_start_time, cw.period_start), 
+                INTERVAL '0 seconds'
+            )) / NULLIF(EXTRACT(EPOCH FROM (ws.order_end_time - ws.order_start_time)), 0)
+        ) AS Au_gpt,
+        (ws.total_prod_drill_meters *
+            EXTRACT(EPOCH FROM GREATEST(
+                LEAST(ws.order_end_time, cw.period_end) - 
+                GREATEST(ws.order_start_time, cw.period_start), 
+                INTERVAL '0 seconds'
+            )) / NULLIF(EXTRACT(EPOCH FROM (ws.order_end_time - ws.order_start_time)), 0)
+        ) AS total_prod_drill_meters
+    FROM cal_hourly cw
+    LEFT JOIN work_schedule ws
+        ON ws.order_end_time > cw.period_start 
+       AND ws.order_start_time < cw.period_end
+),
+plan_metrics as (
+SELECT 
+    period_start,
+    period_end,
+    date,
+    year,
+    schedule_id,
+    request_id,
+    order_id,
+    COALESCE(SUM(CASE 
+        WHEN work_master_id = 'Prod Extraction' AND material_definition_id = 'ROM' AND material_use = 'Produced'
+        THEN mass ELSE 0 END), 0) AS "Production Ore Tonnes - Plan",
+    COALESCE(SUM(CASE 
+        WHEN work_master_id = 'Dev Extraction' AND material_definition_id = 'ROM' AND material_use = 'Produced'
+        THEN mass ELSE 0 END), 0) AS "Development Ore Tonnes - Plan",
+    COALESCE(SUM(CASE 
+        WHEN work_master_id = 'Dev Extraction' AND material_definition_id = 'Waste' AND material_use = 'Produced'
+        THEN mass ELSE 0 END), 0) AS "Development Waste Tonnes - Plan"
+FROM plan
+GROUP BY period_start, period_end, date, year, schedule_id, request_id, order_id
+),
+actuals AS (
+    SELECT    
+    date_trunc('hour', jr.end_time) AS hour_bucket,
+    JR.entity_type,
+    JR.job_response_sk,
+    JR.effective_from_time,
+    JR.effective_to_time,
+    JR.record_time,
+    JR.last_update_time,
+    JR.previous_datamart_sk,
+    JR.next_datamart_sk,
+    JR.source_system,
+    JR.job_response_id,
+    JR.start_time,
+    JR.end_time,
+    JR.hierarchy_scope,
+    JR.hierarchy_scope_path,
+    JR.work_type,
+    JR.job_order_id,
+    JR.work_directive_id,
+    JR.work_master_id,
+    JR.job_state,
+    JR.source_hierarchy_scope_path,
+    JR.source_material_lot_id,
+    JR.source_material_definition_id,
+    JR.dest_hierarchy_scope_path,
+    JR.dest_material_lot_id,
+    JR.dest_material_definition_id,
+    JR.expenditure,
+    JR.dev_type,
+    JR.mass,
+    JR.au_mass,
+    JR.au_gpt,
+    JR.distance_travelled,
+    JR.distance_hauled,
+    JR.total_prod_drill_meters,
+    JR.progression_meters,
+    pa.person_id AS role_performed,
+    ea.equipment_class_id AS equipment_class_id,
+    ea.equipment_id AS equipment_used
+FROM
+    datamart.job_response jr
+LEFT JOIN datamart.personnel_actual pa
+    ON jr.job_response_sk = pa.parent_entity_sk
+LEFT JOIN datamart.equipment_actual ea
+    ON jr.job_response_sk = ea.parent_entity_sk
+where ea.equipment_class_id like 'Haul Truck' 
+),
+actual_metrics AS (
+    SELECT 
+        hour_bucket AS period_start,
+        hour_bucket + INTERVAL '1 hour' AS period_end,
+        COALESCE(SUM(CASE 
+            WHEN work_master_id = 'Prod Extraction'
+            THEN mass ELSE 0 END), 0) AS "Production Ore Tonnes - Actual",
+        COALESCE(SUM(CASE 
+            WHEN work_master_id = 'Dev Extraction' AND dest_material_definition_id = 'ROM'
+            THEN mass ELSE 0 END), 0) AS "Development Ore Tonnes - Actual",
+        COALESCE(SUM(CASE 
+            WHEN work_master_id = 'Dev Extraction' AND dest_material_definition_id = 'Waste'
+            THEN mass ELSE 0 END), 0) AS "Development Waste Tonnes - Actual"
+    FROM actuals
+    GROUP BY hour_bucket
+)
+-- Final comparison output
+SELECT 
+    pm.period_start,
+    pm.period_end,
+    pm.date,
+    pm.year,
+    pm.schedule_id,
+    pm."Production Ore Tonnes - Plan",
+    pm."Development Ore Tonnes - Plan",
+    pm."Development Waste Tonnes - Plan",
+    COALESCE(am."Production Ore Tonnes - Actual", 0) AS "Production Ore Tonnes - Actual",
+    COALESCE(am."Development Ore Tonnes - Actual", 0) AS "Development Ore Tonnes - Actual",
+    COALESCE(am."Development Waste Tonnes - Actual", 0) AS "Development Waste Tonnes - Actual"
+FROM plan_metrics pm
+LEFT JOIN actual_metrics am 
+    ON am.period_start = pm.period_start
