@@ -28,26 +28,26 @@ WITH MR_base AS (
     LEFT JOIN datamart.work_schedule ws
       ON wr.parent_entity_sk = ws.work_schedule_sk
     where mr.schedule_id ilike 'W%'
-    and mr.work_master_id ilike '%bogging'
+    and mr.work_master_id ilike '%bogging'			--- Need to add Drilling work masters
 ),
 MR_consumed AS (
     SELECT *
     FROM MR_base
     WHERE material_use = 'Consumed'
-),
+/*),
 MR_produced AS (
     SELECT *
     FROM MR_base
-    WHERE material_use = 'Produced'
+    WHERE material_use = 'Produced'*/
 ),
 DM_MR AS (
     SELECT
-        p.request_id,
-        p.schedule_id,
-        p.order_id,
-        p.order_start_time,
-        p.order_end_time,
-        p.work_master_id,
+        c.request_id,
+        c.schedule_id,
+        c.order_id,
+        c.order_start_time,
+        c.order_end_time,
+        c.work_master_id,
         -- Source
         c.material_lot_id AS source_material_lot_id,
         c.material_definition_id AS source_material_definition_id,
@@ -56,19 +56,17 @@ DM_MR AS (
         c.storage_location_type AS source_storage_location_type,
         --c.hierarchy_scope AS source_hierarchy_scope,
         --c.hierarchy_scope_path AS source_hierarchy_scope_path,
-        c.mass AS source_mass,
+        c.mass AS source_mass
         -- Destination
-        p.material_lot_id AS dest_material_lot_id,
-        p.material_definition_id AS dest_material_definition_id,
-        p.material_class_id AS dest_material_class_id,
-        p.storage_location AS dest_storage_location,
-        p.storage_location_type AS dest_storage_location_type,
+        --p.material_lot_id AS dest_material_lot_id,
+        --p.material_definition_id AS dest_material_definition_id,
+        --p.material_class_id AS dest_material_class_id,
+        --p.storage_location AS dest_storage_location,
+        --p.storage_location_type AS dest_storage_location_type,
         --p.hierarchy_scope AS dest_hierarchy_scope,
-       -- p.hierarchy_scope_path AS dest_hierarchy_scope_path,
-        p.mass AS dest_mass
-    FROM MR_produced p
-    INNER JOIN MR_consumed c
-      ON c.parent_entity_sk = p.parent_entity_sk
+        --p.hierarchy_scope_path AS dest_hierarchy_scope_path,
+        --p.mass AS dest_mass
+    FROM MR_consumed c
 ),
 actuals as (
 	select
