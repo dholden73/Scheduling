@@ -1,0 +1,102 @@
+--Job Order Versus Job Response
+WITH plan AS (
+    SELECT 
+        --jo.entity_type AS jo_entity_type,
+		--jo.job_order_sk AS jo_job_order_sk,
+		--jo.parent_entity_sk AS jo_parent_entity_sk,
+		--jo.last_update_time AS jo_last_update_time,
+		jo.source_system AS jo_source_system,
+		jo.job_order_id AS jo_job_order_id,
+		jo.start_time AS jo_start_time,
+		jo.end_time AS jo_end_time,
+		--jo.hierarchy_scope AS jo_hierarchy_scope,
+		--jo.hierarchy_scope_path AS jo_hierarchy_scope_path,
+		--jo.work_type AS jo_work_type,
+		jo.work_master_id AS jo_work_master_id,
+		--jo.priority AS jo_priority,
+		jo.source_hierarchy_scope_path AS jo_source_hierarchy_scope_path,
+		jo.source_material_lot_id AS jo_source_material_lot_id,
+		jo.source_material_definition_id AS jo_source_material_definition_id,
+		jo.dest_hierarchy_scope_path AS jo_dest_hierarchy_scope_path,
+		jo.dest_material_lot_id AS jo_dest_material_lot_id,
+		jo.dest_material_definition_id AS jo_dest_material_definition_id,
+		--jo.expenditure AS jo_expenditure,
+		--jo.dev_type AS jo_dev_type,
+		jo.mass AS jo_mass,
+		--jo.au_mass AS jo_au_mass,
+		--jo.au_gpt AS jo_au_gpt,
+		--jo.total_prod_drill_meters AS jo_total_prod_drill_meters,
+		--jo.progression_meters AS jo_progression_meters,
+		--jo.segment_requirement_id AS jo_segment_requirement_id,
+		jo.work_schedule_id AS jo_work_schedule_id,
+		jo.work_schedule_state AS jo_work_schedule_state,
+		jo.work_request_id AS jo_work_request_id,
+		--jo.command AS jo_command,
+		--jo.command_rule AS jo_command_rule,
+		jo.dispatch_status AS jo_dispatch_status,
+        EXTRACT(EPOCH FROM (jo.end_time - jo.start_time)) / 3600 AS jo_plan_duration_hours
+    FROM datamart.job_order jo
+),
+actuals AS (
+    SELECT    
+		--jr.effective_from_time AS jr_effective_from_time,
+		--jr.record_time AS jr_record_time,
+		--jr.last_update_time AS jr_last_update_time,
+		--jr.source_system AS jr_source_system,
+		--jr.job_response_id AS jr_job_response_id,
+		jr.job_order_id AS jr_job_order_id,
+		min(jr.start_time) AS jr_start_time,
+		max(jr.end_time) AS jr_end_time,
+		--jr.hierarchy_scope AS jr_hierarchy_scope,
+		--jr.hierarchy_scope_path AS jr_hierarchy_scope_path,
+		--jr.work_type AS jr_work_type,
+		--jr.work_master_id AS jr_work_master_id,
+		--jr.work_directive_id AS jr_work_directive_id,
+		--jr.job_state AS jr_job_state,
+		--jr.source_hierarchy_scope_path AS jr_source_hierarchy_scope_path,
+		jr.source_material_lot_id AS jr_source_material_lot_id,
+		jr.source_material_definition_id AS jr_source_material_definition_id,
+		--jr.dest_hierarchy_scope_path AS jr_dest_hierarchy_scope_path,
+		jr.dest_material_lot_id AS jr_dest_material_lot_id,
+		jr.dest_material_definition_id AS jr_dest_material_definition_id,
+		--jr.expenditure AS jr_expenditure,
+		--jr.dev_type AS jr_dev_type,
+		SUM(jr.mass) AS jr_total_mass,
+        SUM(jr.au_mass) AS jr_total_au_mass,
+        MAX(jr.au_gpt) AS jr_au_gpt,
+        SUM(jr.total_prod_drill_meters) AS jr_total_prod_drill_meters,
+        SUM(jr.progression_meters) AS jr_total_progression_meters,
+        extract (EPOCH FROM (max(jr.end_time)  - min(jr.start_time)))/3600 as jr_actual_duration_hours
+    FROM datamart.job_response jr
+        GROUP BY 
+        jr.job_order_id,
+        jr.source_material_lot_id,
+        jr.source_material_definition_id,
+        jr.dest_material_lot_id,
+        jr.dest_material_definition_id
+        --jr.expenditure,
+        --jr.dev_type
+),
+cal as (
+	select 
+		period_start AT TIME ZONE 'Australia/Perth' AT TIME ZONE 'UTC' AS plan_period_start,
+        period_end AT TIME ZONE 'Australia/Perth' AT TIME ZONE 'UTC' AS plan_period_end,
+        date
+	 from datamart.cal_days
+)
+    SELECT 
+    	c.*,
+    	CASE 
+    	WHEN DATE_part('hour', COALESCE(p.jo_end_time)) >= 18 THEN 'NS'
+    	ELSE 'DS' end as shift,
+        a.*,
+        p.*
+    FROM plan p
+    left JOIN actuals a on a.jr_job_order_id = p.jo_job_order_id 
+    AND a.jr_start_time > '2025-10-01'
+    LEFT JOIN cal c 
+ ON COALESCE(p.jo_start_time) >= c.plan_period_start
+ AND COALESCE(p.jo_start_time) < c.plan_period_end
+--where a.jr_start_time >'2025-06-01'
+--and p.jo_job_order_id ='Backfill Bogging.16000.1'
+order by a.jr_job_order_id asc
