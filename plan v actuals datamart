@@ -1,0 +1,174 @@
+WITH material_requirement_sch AS (
+  SELECT
+    mr.material_use,
+    mr.material_class_id,
+    mr.material_definition_id,
+    mr.material_lot_id,
+    mr.storage_location,
+    mr.storage_location_type,
+    mr.schedule_id,
+    mr.order_start_time,
+    mr.order_end_time,
+    mr.schedule_start_time,
+    mr.schedule_end_time,
+    mr.work_master_id,
+    mr.mass,
+    --mr.au_gpt,
+    mr.total_prod_drill_meters,
+    mr.progression_meters
+  FROM datamart.material_requirement mr
+  LEFT JOIN datamart.job_order    jo ON mr.parent_entity_sk = jo.job_order_sk
+  LEFT JOIN datamart.work_request wr ON jo.parent_entity_sk = wr.work_request_sk
+  LEFT JOIN datamart.work_schedule ws ON wr.parent_entity_sk = ws.work_schedule_sk
+  --WHERE mr.schedule_id ILIKE 'W%'
+),
+cross_calendar AS ( 
+  SELECT 
+    cal.*,
+    wm.wm AS work_master_id
+  FROM datamart.cal_days cal
+  CROSS JOIN (
+    SELECT DISTINCT work_master_id AS wm FROM datamart.job_response
+) wm
+),
+plan AS (
+    SELECT       
+    	c.date,    
+    	p.schedule_id,
+        p.material_definition_id,
+        p.work_master_id,
+        p.material_use,
+        --ws.order_start_time,
+        --ws.order_end_time,
+        sum(
+        coalesce(p.mass,0) *
+            EXTRACT(EPOCH FROM GREATEST(
+                LEAST(p.order_end_time, c.period_end) - GREATEST(p.order_start_time, c.period_start))) / 
+                NULLIF(EXTRACT(EPOCH FROM (p.order_end_time - p.order_start_time)), 0)
+        ) AS plan_mass,
+        sum(
+        coalesce(p.total_prod_drill_meters,0) *
+            EXTRACT(EPOCH FROM GREATEST(
+                LEAST(p.order_end_time, c.period_end) - GREATEST(p.order_start_time, c.period_start))) / 
+                NULLIF(EXTRACT(EPOCH FROM (p.order_end_time - p.order_start_time)), 0)
+        ) AS plan_total_prod_drill_meters,
+        sum(
+        coalesce(p.progression_meters,0) *
+            EXTRACT(EPOCH FROM GREATEST(
+                LEAST(p.order_end_time, c.period_end) - GREATEST(p.order_start_time, c.period_start))) / 
+                NULLIF(EXTRACT(EPOCH FROM (p.order_end_time - p.order_start_time)), 0)
+        ) AS plan_progression_meters
+	FROM cross_calendar c
+	LEFT JOIN material_requirement_sch p
+	    ON p.work_master_id = c.work_master_id
+	    AND p.order_end_time > c.period_start 
+	    AND p.order_start_time < c.period_end 
+	GROUP by
+	c.date, p.work_master_id, p.schedule_id, p.material_use, p.material_definition_id
+),
+actual AS (
+    SELECT       
+	    c.date,
+	    --jr.start_time,
+	    --jr.end_time,
+	    jr.work_master_id,
+	    --jr.source_material_lot_id,
+	    --jr.source_material_definition_id,
+	    --jr.dest_material_lot_id,
+	    --jr.dest_material_definition_id,
+	    --jr.expenditure,
+	    --jr.dev_type,
+	    SUM(COALESCE(jr.mass,0)) as actual_mass,
+	   	SUM(COALESCE(jr.progression_meters,0)) actual_progression_meters,
+	   	SUM(COALESCE(jr.total_prod_drill_meters,0)) as actual_prod_drill_meters
+	    --jr.distance_travelled,
+	    --jr.distance_hauled
+	from cross_calendar c
+	LEFT JOIN datamart.job_response jr
+	    ON jr.work_master_id = c.work_master_id
+	    AND jr.end_time > c.period_start 
+	    AND jr.start_time < c.period_end 
+	GROUP by
+	c.date, jr.work_master_id
+),
+joined AS (
+  SELECT 
+    p.date,
+    --MIN(c.period_start) AS period_start,
+    --MAX(c.period_end) AS period_end,
+    p.work_master_id,
+    --COALESCE(a.material_use, p.material_use) AS material_use,
+    p.work_schedule_id,
+	a.actual_mass,
+	a.actual_progression_meters,
+	a.actual_prod_drill_meters,
+	p.plan_mass,
+	p.plan_progression_meters,
+	p.plan_prod_drill_meters
+  FROM cross_calendar c
+  LEFT JOIN plan p
+    ON p.date = c.date 
+    AND p.work_master_id = c.work_master_id
+  LEFT JOIN actual a
+    ON a.date = c.date 
+    AND a.work_master_id = c.work_master_id
+  GROUP BY c.date, c.work_master_id, p.work_schedule_id, COALESCE(a.material_use, p.material_use)
+)
+SELECT *,
+  SUM(planned_quantity) OVER (
+    PARTITION BY work_master_id, material_use
+    ORDER BY production_day
+    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+  ) AS running_planned_quantity,
+  SUM(actual_quantity) OVER (
+    PARTITION BY work_master_id, material_use
+    ORDER BY production_day
+    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+  ) AS running_actual_quantity,
+  (actual_quantity - planned_quantity) AS variance,
+  (
+    SUM(actual_quantity) OVER (
+      PARTITION BY work_master_id, material_use
+      ORDER BY production_day
+      ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    ) - 
+    SUM(planned_quantity) OVER (
+      PARTITION BY work_master_id, material_use
+      ORDER BY production_day
+      ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    )
+  ) AS running_sum_variance,
+  CASE 
+    WHEN (actual_quantity - planned_quantity) > 0 THEN 'Actual (Above planned)'
+    WHEN (actual_quantity - planned_quantity) < 0 THEN 'Actual (Below planned)'
+    ELSE 'Actual (On target)'
+  END AS variance_color,
+  CASE 
+    WHEN (
+      SUM(actual_quantity) OVER (
+        PARTITION BY work_master_id, material_use
+        ORDER BY production_day
+        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+      ) - 
+      SUM(planned_quantity) OVER (
+        PARTITION BY work_master_id, material_use
+        ORDER BY production_day
+        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+      )
+    ) > 0 THEN 'Actual (Above planned)'
+    WHEN (
+      SUM(actual_quantity) OVER (
+        PARTITION BY work_master_id, material_use
+        ORDER BY production_day
+        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+      ) - 
+      SUM(planned_quantity) OVER (
+        PARTITION BY work_master_id, material_use
+        ORDER BY production_day
+        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+      )
+    ) < 0 THEN 'Actual (Below planned)'
+    ELSE 'Actual (On target)'
+  END AS runnig_variance_color
+FROM joined
+ORDER BY production_day, work_master_id, work_schedule_id
