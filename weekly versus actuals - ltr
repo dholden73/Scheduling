@@ -133,24 +133,24 @@ joined AS (
 SELECT
   *,
   SUM(planned_quantity) OVER (
-    PARTITION BY work_master_id
+    PARTITION BY work_master_id, schedule_id,material_definition_id
     ORDER BY production_day
     ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
   ) AS running_planned_quantity,
   SUM(actual_quantity) OVER (
-    PARTITION BY work_master_id
+    PARTITION BY work_master_id, schedule_id,material_definition_id
     ORDER BY production_day
     ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
   ) AS running_actual_quantity,
   (actual_quantity - planned_quantity) AS variance,
   (
     SUM(actual_quantity) OVER (
-      PARTITION BY work_master_id
+      PARTITION BY work_master_id, schedule_id,material_definition_id
       ORDER BY production_day
       ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
     ) -
     SUM(planned_quantity) OVER (
-      PARTITION BY work_master_id
+      PARTITION BY work_master_id, schedule_id,material_definition_id
       ORDER BY production_day
       ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
     )
@@ -163,24 +163,24 @@ SELECT
   CASE
     WHEN (
       SUM(actual_quantity) OVER (
-        PARTITION BY work_master_id
+        PARTITION BY work_master_id, schedule_id, material_definition_id
         ORDER BY production_day
         ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
       ) -
       SUM(planned_quantity) OVER (
-        PARTITION BY work_master_id
+        PARTITION BY work_master_id, schedule_id,material_definition_id
         ORDER BY production_day
         ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
       )
     ) > 0 THEN 'Actual (Above planned)'
     WHEN (
       SUM(actual_quantity) OVER (
-        PARTITION BY work_master_id
+        PARTITION BY work_master_id, schedule_id, material_definition_id
         ORDER BY production_day
         ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
       ) -
       SUM(planned_quantity) OVER (
-        PARTITION BY work_master_id
+        PARTITION BY work_master_id, schedule_id,material_definition_id
         ORDER BY production_day
         ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
       )
