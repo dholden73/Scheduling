@@ -45,7 +45,7 @@ plan AS (
     p.schedule_id,
     p.material_definition_id,
     p.work_master_id,
-    'Produced'::text AS material_use,
+    p.material_use,
     MAX(qp.uom) AS planned_uom,
     SUM(
       COALESCE(qp.value_num, 0) *
@@ -68,6 +68,7 @@ plan AS (
   GROUP BY
     c.date,
     p.work_master_id,
+    p.material_use,
     p.schedule_id,
     p.material_definition_id
 ),
@@ -123,7 +124,7 @@ joined AS (
 SELECT
   *,
   SUM(planned_quantity) OVER (
-    PARTITION BY work_master_id, material_use, schedule_id
+    PARTITION BY work_master_id, material_use
     ORDER BY production_day
     ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
   ) AS running_planned_quantity,
