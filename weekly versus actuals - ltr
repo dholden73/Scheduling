@@ -45,7 +45,6 @@ plan AS (
     p.schedule_id,
     p.material_definition_id,
     p.work_master_id,
-    p.material_use,
     MAX(qp.uom) AS planned_uom,
     SUM(
       COALESCE(qp.value_num, 0) *
@@ -68,7 +67,6 @@ plan AS (
   GROUP BY
     c.date,
     p.work_master_id,
-    p.material_use,
     p.schedule_id,
     p.material_definition_id
 ),
@@ -84,38 +82,45 @@ plan_first_7_days AS (
   WHERE x.date < x.first_schedule_date + INTERVAL '7 days'
 ),
 actual AS (
-  SELECT
-    c.date,
-    c.work_master_id,
-    'Produced'::text AS material_use,
-    MAX(qa.uom) AS actual_uom,
-    SUM(COALESCE(qa.value_num, 0)) AS actual_quantity
-  FROM cross_calendar c
-  LEFT JOIN datamart.job_response jr
-    ON jr.work_master_id = c.work_master_id
-   AND (jr.end_time at time zone 'UTC') >= c.start
-   AND (jr.end_time at time zone 'UTC')  < c.end
-  LEFT JOIN datamart.material_actual ma
-    ON ma.parent_datamart_sk = jr.datamart_sk
-   AND ma.material_use = 'Produced'
-  LEFT JOIN datamart.quantity qa
-    ON qa.parent_datamart_sk = ma.datamart_sk
-   AND qa.key ILIKE 'mass'
-  GROUP BY
-    c.date,
-    c.work_master_id
+	SELECT
+	    c.date,
+	    c.start,
+	    c.end,
+	    jr.dest_material_definition_id as dest_MD,
+	    --(jr.end_time at time zone 'UTC'), 
+	    c.work_master_id,
+	    'Produced'::text AS material_use,
+	    SUM(COALESCE(qa.value_num, 0)) AS actual_quantity
+	  FROM cross_calendar c
+	  LEFT JOIN datamart.job_response jr
+	    ON jr.work_master_id = c.work_master_id
+	   AND (jr.end_time at time zone 'UTC') >= c.start
+	   AND (jr.end_time at time zone 'UTC')  < c.end
+	   AND jr.dest_material_definition_id IS not NULL
+	  LEFT JOIN datamart.material_actual ma
+	    ON ma.parent_datamart_sk = jr.datamart_sk
+	   AND ma.material_use = 'Produced'
+	  LEFT JOIN datamart.quantity qa
+	    ON qa.parent_datamart_sk = ma.datamart_sk
+	   AND qa.key ILIKE 'mass'
+	  GROUP BY
+	    c.date,
+	    c.start,
+	    c.end,
+	    c.work_master_id,
+	    jr.dest_material_definition_id
 ),
 joined AS (
   SELECT
     c.date AS production_day,
-    MIN(c.start) AS period_start,
-    MAX(c.end) AS period_end,
+    --MIN(c.start) AS period_start,
+    --MAX(c.end) AS period_end,
     c.work_master_id,
-    'Produced'::text AS material_use,
+    p.material_definition_id,
     p.schedule_id,
     COALESCE(a.actual_quantity, 0) AS actual_quantity,
     COALESCE(p.planned_quantity, 0) AS planned_quantity,
-    coalesce(a.actual_uom,p.planned_uom) as uom
+    p.planned_uom as uom
   FROM cross_calendar c
   LEFT JOIN plan_first_7_days p
     ON p.date = c.date
@@ -123,36 +128,29 @@ joined AS (
   LEFT JOIN actual a
     ON a.date = c.date
    AND a.work_master_id = c.work_master_id
-  GROUP BY
-    c.date,
-    c.work_master_id,
-    p.schedule_id,
-    a.actual_quantity,
-    p.planned_quantity,
-    a.actual_uom,
-    p.planned_uom
+   AND a.dest_MD = p.material_definition_id
 )
 SELECT
   *,
   SUM(planned_quantity) OVER (
-    PARTITION BY work_master_id, material_use
+    PARTITION BY work_master_id
     ORDER BY production_day
     ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
   ) AS running_planned_quantity,
   SUM(actual_quantity) OVER (
-    PARTITION BY work_master_id, material_use
+    PARTITION BY work_master_id
     ORDER BY production_day
     ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
   ) AS running_actual_quantity,
   (actual_quantity - planned_quantity) AS variance,
   (
     SUM(actual_quantity) OVER (
-      PARTITION BY work_master_id, material_use
+      PARTITION BY work_master_id
       ORDER BY production_day
       ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
     ) -
     SUM(planned_quantity) OVER (
-      PARTITION BY work_master_id, material_use, schedule_id
+      PARTITION BY work_master_id
       ORDER BY production_day
       ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
     )
@@ -165,24 +163,24 @@ SELECT
   CASE
     WHEN (
       SUM(actual_quantity) OVER (
-        PARTITION BY work_master_id, material_use
+        PARTITION BY work_master_id
         ORDER BY production_day
         ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
       ) -
       SUM(planned_quantity) OVER (
-        PARTITION BY work_master_id, material_use
+        PARTITION BY work_master_id
         ORDER BY production_day
         ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
       )
     ) > 0 THEN 'Actual (Above planned)'
     WHEN (
       SUM(actual_quantity) OVER (
-        PARTITION BY work_master_id, material_use
+        PARTITION BY work_master_id
         ORDER BY production_day
         ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
       ) -
       SUM(planned_quantity) OVER (
-        PARTITION BY work_master_id, material_use
+        PARTITION BY work_master_id
         ORDER BY production_day
         ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
       )
