@@ -28,7 +28,9 @@ WITH material_requirement_sch AS (
 ),
 cross_calendar AS (
   SELECT
-    cal.*,
+    (cal.period_start at time zone 'UTC') as start,
+    (cal.period_end at time zone 'UTC') as end,
+    cal.date,
     wm.wm AS work_master_id
   FROM datamart.cal_days cal
   CROSS JOIN (
@@ -49,8 +51,8 @@ plan AS (
       COALESCE(qp.value_num, 0) *
       EXTRACT(
         EPOCH FROM (
-          LEAST(p.order_end_time, c.period_end)
-          - GREATEST(p.order_start_time, c.period_start)
+          LEAST(p.order_end_time, c.end)
+          - GREATEST(p.order_start_time, c.start)
         )
       ) /
       NULLIF(EXTRACT(EPOCH FROM (p.order_end_time - p.order_start_time)), 0)
@@ -58,8 +60,8 @@ plan AS (
   FROM cross_calendar c
   LEFT JOIN material_requirement_sch p
     ON p.work_master_id = c.work_master_id
-   AND p.order_end_time > c.period_start
-   AND p.order_start_time < c.period_end
+   AND p.order_end_time > c.start
+   AND p.order_start_time < c.end
   LEFT JOIN datamart.quantity qp
     ON qp.parent_datamart_sk = p.datamart_sk
    AND qp.key ILIKE 'mass'
@@ -79,8 +81,8 @@ actual AS (
   FROM cross_calendar c
   LEFT JOIN datamart.job_response jr
     ON jr.work_master_id = c.work_master_id
-   AND jr.end_time > c.period_start
-   AND jr.start_time < c.period_end
+   AND (jr.end_time at time zone 'UTC') >= c.start
+   AND (jr.end_time at time zone 'UTC')  < c.end
   LEFT JOIN datamart.material_actual ma
     ON ma.parent_datamart_sk = jr.datamart_sk
    AND ma.material_use = 'Produced'
@@ -94,8 +96,8 @@ actual AS (
 joined AS (
   SELECT
     c.date AS production_day,
-    MIN(c.period_start) AS period_start,
-    MAX(c.period_end) AS period_end,
+    MIN(c.start) AS period_start,
+    MAX(c.end) AS period_end,
     c.work_master_id,
     'Produced'::text AS material_use,
     p.schedule_id,
@@ -178,4 +180,4 @@ SELECT
 FROM joined
 --where schedule_id = 'WK_2026_01_20251230_OMS_V1'
 where work_master_id = 'Prod Extraction'
-ORDER BY production_day, work_master_id, schedule_id DESC;
+ORDER BY schedule_id, production_day, work_master_id DESC;
