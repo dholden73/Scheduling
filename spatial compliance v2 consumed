@@ -1,0 +1,88 @@
+WITH MR_base AS (
+    SELECT
+        mr.material_use,
+        mr.material_class_id,
+        mr.material_definition_id,
+        mr.material_lot_id,
+        mr.parent_entity_sk,
+        mr.storage_location,
+        mr.storage_location_type,
+        mr.schedule_id,
+        mr.schedule_start_time,
+        mr.schedule_end_time,
+        mr.schedule_state,
+        mr.request_id,
+        mr.request_start_time,
+        mr.request_end_time,
+        mr.order_id,
+        mr.order_start_time,
+        mr.order_end_time,
+        mr.work_master_id,
+        mr.mass,
+        ws.record_time
+    FROM datamart.material_requirement mr
+    LEFT JOIN datamart.job_order jo
+      ON mr.parent_entity_sk = jo.job_order_sk
+    LEFT JOIN datamart.work_request wr
+      ON jo.parent_entity_sk = wr.work_request_sk
+    LEFT JOIN datamart.work_schedule ws
+      ON wr.parent_entity_sk = ws.work_schedule_sk
+    where mr.schedule_id ilike 'W%'
+    and mr.work_master_id IN ('Dev Bogging','Prod Remote Bogging,','Dev Drilling','Prod Drilling')		--- Need to add Drilling work masters
+),
+DM_MR AS (
+    SELECT
+        c.request_id,
+        c.schedule_id,
+        c.order_id,
+        c.order_start_time,
+        c.order_end_time,
+        c.work_master_id,
+        -- Source
+        c.material_lot_id AS source_material_lot_id,
+        c.material_definition_id AS source_material_definition_id,
+        c.material_class_id AS source_material_class_id,
+        c.storage_location AS source_storage_location,
+        c.storage_location_type AS source_storage_location_type,
+        --c.hierarchy_scope AS source_hierarchy_scope,
+        --c.hierarchy_scope_path AS source_hierarchy_scope_path,
+        c.mass AS source_mass
+        -- Destination
+        --p.material_lot_id AS dest_material_lot_id,
+        --p.material_definition_id AS dest_material_definition_id,
+        --p.material_class_id AS dest_material_class_id,
+        --p.storage_location AS dest_storage_location,
+        --p.storage_location_type AS dest_storage_location_type,
+        --p.hierarchy_scope AS dest_hierarchy_scope,
+        --p.hierarchy_scope_path AS dest_hierarchy_scope_path,
+        --p.mass AS dest_mass
+    FROM MR_base c
+    WHERE material_use = 'Consumed'
+),
+actuals as (
+	select
+		jr.start_time,
+		jr.end_time,
+		jr.job_order_id,
+		jr.source_material_lot_id,
+		jr.source_material_definition_id,
+		jr.dest_material_lot_id,
+		jr.dest_material_definition_id,
+		sum(jr.mass) as actual_tonnes
+	from datamart.job_response jr
+	group by 
+		jr.start_time,
+		jr.end_time,
+		jr.job_order_id,
+		jr.source_material_lot_id,
+		jr.source_material_definition_id,
+		jr.dest_material_lot_id,
+		jr.dest_material_definition_id
+)
+	SELECT
+		mr.*,
+		a.*
+	from actuals a
+	join DM_MR mr
+	 on a.job_order_id = mr.order_id
+	 
