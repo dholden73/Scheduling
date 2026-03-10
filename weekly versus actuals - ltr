@@ -72,6 +72,17 @@ plan AS (
     p.schedule_id,
     p.material_definition_id
 ),
+plan_first_7_days AS (
+  SELECT *
+  FROM (
+    SELECT
+      p.*,
+      MIN(p.date) OVER (PARTITION BY p.schedule_id) AS first_schedule_date
+    FROM plan p
+    WHERE p.schedule_id IS NOT NULL
+  ) x
+  WHERE x.date < x.first_schedule_date + INTERVAL '7 days'
+),
 actual AS (
   SELECT
     c.date,
@@ -106,7 +117,7 @@ joined AS (
     COALESCE(p.planned_quantity, 0) AS planned_quantity,
     coalesce(a.actual_uom,p.planned_uom) as uom
   FROM cross_calendar c
-  LEFT JOIN plan p
+  LEFT JOIN plan_first_7_days p
     ON p.date = c.date
    AND p.work_master_id = c.work_master_id
   LEFT JOIN actual a
