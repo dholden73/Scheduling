@@ -1,0 +1,95 @@
+WITH material_requirement_sch AS (
+  SELECT
+    mr.datamart_sk,
+    mr.entity_type,
+    mr.material_requirement_sk,
+    mr.parent_entity_type,
+    mr.parent_entity_sk,
+    mr.parent_datamart_sk,
+    mr.root_entity_type,
+    mr.root_entity_sk,
+    mr.root_datamart_sk,
+    mr.last_update_time,
+    mr.source_system,
+    mr.ingestion_reference_sk,
+    mr.parent_material_requirement_sk,
+    mr.material_requirement_id,
+    mr.description,
+    mr.hierarchy_scope,
+    mr.hierarchy_scope_path,
+    mr.material_use,
+    mr.material_class_id,
+    mr.material_definition_id,
+    mr.material_lot_id,
+    mr.assembly_type,
+    mr.assembly_relationship,
+    mr.storage_location,
+    mr.storage_location_type,
+    mr.required_by_request_segment_response,
+    mr.test_specification_id,
+    mr.schedule_type,
+    mr.schedule_id,
+    mr.schedule_work_type,
+    mr.schedule_start_time,
+    mr.schedule_end_time,
+    mr.schedule_state,
+    mr.request_id,
+    mr.request_start_time,
+    mr.request_end_time,
+    mr.order_id,
+    mr.order_start_time,
+    mr.order_end_time,
+    mr.work_master_id,
+    mr.mass,
+    mr.au_mass,
+    mr.au_gpt,
+    mr.total_prod_drill_meters,
+    mr.progression_meters
+  FROM datamart.material_requirement mr
+  LEFT JOIN datamart.job_order    jo ON mr.parent_entity_sk = jo.job_order_sk
+  LEFT JOIN datamart.work_request wr ON jo.parent_entity_sk = wr.work_request_sk
+  LEFT JOIN datamart.work_schedule ws ON wr.parent_entity_sk = ws.work_schedule_sk
+  WHERE mr.schedule_id ILIKE 'SH%' OR mr.schedule_id ILIKE 'W%'
+),
+-- bound calendar to only the days needed for performance
+cal_bounds AS (
+  SELECT
+    MIN(schedule_start_time) AS min_sched,
+    MAX(schedule_end_time)   AS max_sched
+  FROM material_requirement_sch
+),
+cross_calendar AS (
+  SELECT cal.*
+  FROM datamart.cal_days cal
+  JOIN cal_bounds b
+    ON cal.period_end   > b.min_sched
+   AND cal.period_start < b.max_sched
+)
+SELECT
+  c.date,
+  MIN(p.schedule_start_time) AS schedule_start_time,
+  MAX(p.schedule_end_time)   AS schedule_end_time,
+  p.work_master_id,
+  p.schedule_id,
+  p.material_use,
+  p.material_definition_id,
+  p.order_id,
+ SUM( COALESCE(p.mass, NULL) * EXTRACT(EPOCH FROM (LEAST(p.order_end_time, c.period_end) 
+ - GREATEST(p.order_start_time, c.period_start))) / NULLIF(EXTRACT(EPOCH FROM (p.order_end_time - p.order_start_time)), NULL) ) as planned_quantity, 
+ SUM( COALESCE(p.total_prod_drill_meters, NULL) * EXTRACT(EPOCH FROM (LEAST(p.order_end_time, c.period_end) 
+ - GREATEST(p.order_start_time, c.period_start))) / NULLIF(EXTRACT(EPOCH FROM (p.order_end_time - p.order_start_time)), NULL) ) AS total_prod_drill_meters, 
+ SUM( COALESCE(p.progression_meters, NULL) * EXTRACT(EPOCH FROM (LEAST(p.order_end_time, c.period_end) 
+ - GREATEST(p.order_start_time, c.period_start))) / NULLIF(EXTRACT(EPOCH FROM (p.order_end_time - p.order_start_time)), NULL) ) AS planned_meters,
+   p.au_gpt
+FROM cross_calendar c
+LEFT JOIN material_requirement_sch p
+  -- Use SCHEDULE window to decide which calendar days to include
+  ON p.order_end_time   > c.period_start
+ AND p.order_start_time < c.period_end
+WHERE c.period_start >= p.schedule_start_time
+  AND c.period_end   <= p.schedule_end_time 
+  and schedule_id = 'Week 44 V2.1 Z135 E 4551 OD Cuts, Z120 HBW 3740-42 OD Cuts Added'
+GROUP BY
+  c.date, p.work_master_id, p.schedule_id, p.material_use, p.material_definition_id, p.au_gpt,p.order_id
+  
+
