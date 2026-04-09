@@ -1,0 +1,248 @@
+-- retrieve the lastest schedule version
+ with latest_ops_schedule AS (
+ SELECT DISTINCT ON (operations_schedule_id) *
+    FROM dw.operations_schedule
+    ORDER BY operations_schedule_id, record_time DESC
+),
+material_requirement_sch AS (
+    SELECT
+        mr.material_use, mr.material_definition_ids[1] AS material_definition_id,
+        mr.material_requirement_sk, mr.storage_location, ws.operations_schedule_id,
+        jo.start_time AS order_start_time, jo.end_time AS order_end_time, jo.job_order_sk,
+        ws.start_time, ws.end_time, jo.work_master_id,
+        mr.main_quantity_value_dec AS qty, mr.main_quantity_uom AS uom
+    FROM dw.material_requirement mr
+    LEFT JOIN dw.job_order jo    ON mr.entity_sk = jo.job_order_sk
+    LEFT JOIN dw.operations_request wr ON jo.entity_sk = wr.operations_request_sk
+    LEFT JOIN  latest_work_schedule ws ON wr.operations_schedule_sk = ws.operations_schedule_sk
+    WHERE jo.work_master_id IN ('Extraction','Dev Drilling','Prod Drilling','RaiseBore Drilling','Diamond Drilling','Paste Filling')
+),
+params AS (
+    SELECT entity_sk,
+        MAX(CASE WHEN id = 'Active'              THEN value END) AS active,
+        MAX(CASE WHEN id = 'SchedID'             THEN value END) AS sched_id,
+        MAX(CASE WHEN id = 'Priority'            THEN value END) AS priority,
+        MAX(CASE WHEN id = 'Lateral Development' THEN value END) AS dev_advance,
+        MAX(CASE WHEN id = 'Dev Type'            THEN value END) AS dev_type,
+        MAX(CASE WHEN id = 'Drilling Type'       THEN value END) AS drill_type
+    FROM dw.parameter
+    WHERE id IN ('Active','SchedID','Priority','Meters','Drilling Type','Dev Type','Lateral Development')
+    GROUP BY entity_sk
+),
+MR_base AS (
+    SELECT
+        p.operations_schedule_id, p.start_time, p.end_time,
+        p.material_requirement_sk, p.material_definition_id,
+        p.work_master_id, p.material_use, p.storage_location, p.qty, p.uom,
+        pa.sched_id, pa.active, pa.priority, pa.dev_type, pa.dev_advance, pa.drill_type,
+        t.value    AS haul_type,
+        li2o.value AS haul_grade,
+        li2o.unit_of_measure
+    FROM material_requirement_sch p
+    LEFT JOIN params pa    ON pa.entity_sk = p.job_order_sk
+    LEFT JOIN dw.property t
+        ON t.entity_sk = p.material_requirement_sk AND t.id = 'Type'
+    LEFT JOIN dw.property li2o
+        ON li2o.entity_sk = p.material_requirement_sk AND li2o.id = 'Li2O'
+    WHERE p.storage_location IS NOT NULL
+),
+planned_raw AS (
+    -- Extraction: tonne metrics
+    SELECT b.start_time, b.end_time, b.storage_location, b.active, b.priority,
+        CASE
+            WHEN b.haul_type = 'OSP'      THEN 'OSP'
+            WHEN b.haul_type = 'Dev Ore'  THEN 'Development Ore'
+            WHEN b.haul_type = 'Prod Ore' THEN 'Production Ore'
+            WHEN b.haul_type = 'Waste'    THEN 'Waste'
+            ELSE NULL
+        END AS metric,
+        b.qty
+    FROM MR_base b WHERE b.work_master_id = 'Extraction'
+    UNION ALL
+    SELECT b.start_time, b.end_time, b.storage_location, b.active, b.priority,
+        CASE
+            WHEN b.haul_type = 'OSP'      THEN 'OSP Li Mass'
+            WHEN b.haul_type = 'Dev Ore'  THEN 'Development Ore Li Mass'
+            WHEN b.haul_type = 'Prod Ore' THEN 'Production Ore Li Mass'
+            ELSE NULL
+        END AS metric,
+        (b.haul_grade::numeric / 100.0) * b.qty::numeric AS qty
+    FROM MR_base b 
+    WHERE b.work_master_id = 'Extraction'
+    AND b.haul_grade IS NOT NULL
+    UNION ALL
+    -- Dev Drilling
+    SELECT d.start_time, d.end_time, d.storage_location, d.active, d.priority,
+        CASE
+            WHEN d.dev_type = 'Cap Dec' THEN 'Decline'
+            WHEN d.dev_type = 'Op Lat'  THEN 'Operating'
+            WHEN d.dev_type = 'Cap Lat' THEN 'Capital'
+            ELSE NULL
+        END AS metric,
+        d.dev_advance::numeric AS qty
+    FROM MR_base d WHERE d.work_master_id = 'Dev Drilling'
+    UNION ALL
+    --Prod Drilling
+    SELECT p.start_time, p.end_time, p.storage_location, p.active, p.priority,
+        CASE
+            WHEN p.drill_type = 'Prod' THEN 'Production Drilling'
+            WHEN p.drill_type = 'Cap'  THEN 'Capital Drilling'
+            ELSE NULL
+        END AS metric,
+        p.qty
+    FROM MR_base p
+    UNION ALL
+    SELECT rb.start_time, rb.end_time, rb.storage_location, rb.active, rb.priority,
+        CASE 
+            WHEN rb.work_master_id = 'RaiseBore Drilling' THEN 'Rhino Rising' 
+            ELSE rb.work_master_id 
+        END as metric,
+        rb.qty
+    FROM MR_base rb
+    UNION ALL
+    SELECT rb.start_time, rb.end_time, rb.storage_location, rb.active, rb.priority,
+        CASE 
+            WHEN rb.work_master_id = 'Paste Filling' THEN 'Paste Pouring' 
+            ELSE rb.work_master_id 
+        END as metric,
+        rb.qty
+    FROM MR_base rb
+),
+planned_daily AS (
+    SELECT
+        day_series::date AS production_day,
+        pr.start_time AS week_start,pr.metric,
+        pr.qty / NULLIF(
+            (date_trunc('day', pr.end_time)::date
+           - date_trunc('day', pr.start_time)::date), 0
+        ) AS daily_plan
+    FROM planned_raw pr
+    CROSS JOIN LATERAL generate_series(
+        date_trunc('day', pr.start_time)::timestamp,
+        date_trunc('day', pr.end_time)::timestamp - INTERVAL '1 day',
+        INTERVAL '1 day'
+    ) AS day_series
+    WHERE pr.metric IS NOT NULL
+),
+planned_daily_agg AS (
+    SELECT
+        pd.production_day,
+        pd.week_start,
+        pd.metric,
+        SUM(pd.daily_plan)          AS daily_plan
+    FROM planned_daily pd
+    GROUP BY pd.production_day, pd.week_start, pd.metric
+),
+planned_final AS (
+    SELECT production_day, metric, daily_plan, week_start
+    FROM planned_daily_agg
+    UNION ALL
+    SELECT production_day, 'Total Ore Hauled', SUM(daily_plan), week_start
+    FROM planned_daily_agg WHERE metric IN ('Development Ore','Production Ore', 'OSP') GROUP BY production_day, week_start
+    UNION ALL
+    SELECT production_day, 'Total Haulage', SUM(daily_plan), week_start
+    FROM planned_daily_agg WHERE metric IN ('Development Ore','Production Ore','Waste','OSP') GROUP BY production_day, week_start
+    UNION ALL
+    SELECT production_day, 'Total Longhole', SUM(daily_plan), week_start
+    FROM planned_daily_agg WHERE metric IN ('Production Drilling','Capital Drilling') GROUP BY production_day, week_start
+    UNION ALL
+    SELECT production_day, 'Total Development', SUM(daily_plan), week_start
+    FROM planned_daily_agg WHERE metric IN ('Decline','Capital','Operating') GROUP BY production_day, week_start
+    UNION ALL
+    SELECT production_day, 'Total Li Mass', SUM(daily_plan), week_start
+    FROM planned_daily_agg WHERE metric IN ('Development Ore Li Mass','Production Ore Li Mass', 'OSP Li Mass') GROUP BY production_day, week_start
+),
+plan_wtd_mtd AS (
+    SELECT
+        cm.date AS production_day,
+        cm.metric,
+        pf.week_start,
+        CASE
+            WHEN cm.uom = '' THEN NULL
+            ELSE COALESCE(pf.daily_plan, 0)
+        END AS "Plan Last 24hr",
+        -- Plan WTD
+        sum
+        (CASE
+            WHEN  cm.uom = '' THEN NULL
+            ELSE COALESCE(pf.daily_plan, 0) END) OVER plan_wtd_win
+        AS "Plan WTD",
+        -- Plan MTD
+        sum
+        (CASE
+            WHEN cm.uom = '' THEN NULL 
+            ELSE COALESCE(pf.daily_plan, 0) END) OVER plan_mtd_win
+        AS "Plan MTD",
+        -- Plan YTD
+        sum
+        (CASE
+            WHEN cm.uom = '' THEN NULL 
+            ELSE COALESCE(pf.daily_plan, 0) END) OVER plan_ytd_win
+        AS "Plan YTD"
+    FROM calendar_metrics cm
+    LEFT JOIN planned_final pf
+        ON  pf.production_day = cm.date AND pf.metric = cm.metric
+    WINDOW
+        plan_wtd_win AS (
+            PARTITION BY cm.metric,
+                         (date_trunc('week', cm.date - INTERVAL '3 days') + INTERVAL '3 days')
+            ORDER BY cm.date ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        ),
+        plan_mtd_win AS (
+            PARTITION BY cm.metric, date_trunc('month', cm.date)
+            ORDER BY cm.date ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        ),
+        plan_ytd_win AS (
+            PARTITION BY cm.metric, date_trunc('year', cm.date)
+            ORDER BY cm.date ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        )
+),
+planned_withgrades AS (
+    -- All non-grade rows pass through unchanged
+    SELECT * FROM plan_wtd_mtd
+    WHERE metric NOT IN (
+        'Production Ore Grade',
+        'Development Ore Grade',
+        'OSP Grade',
+        'Waste Grade',
+        'Total Ore Grade'
+    )
+    UNION ALL
+    -- Grade rows: for each Li Mass row, lateral-lookup the matching tonne row
+    SELECT
+        lm.production_day,
+        CASE lm.metric
+            WHEN 'Production Ore Li Mass'  THEN 'Production Ore Grade'
+            WHEN 'Development Ore Li Mass' THEN 'Development Ore Grade'
+            WHEN 'OSP Li Mass'             THEN 'OSP Grade'
+            WHEN 'Waste Li Mass'           THEN 'Waste Grade'
+            WHEN 'Total Li Mass'           THEN 'Total Ore Grade'
+        END AS metric,
+        lm.week_start,
+        ROUND(lm."Plan Last 24hr" / NULLIF(t."Plan Last 24hr", 0) * 100, 2) AS "Plan Last 24hr",
+        ROUND(lm."Plan WTD"       / NULLIF(t."Plan WTD",       0) * 100, 2) AS "Plan WTD",
+        ROUND(lm."Plan MTD"       / NULLIF(t."Plan MTD",       0) * 100, 2) AS "Plan MTD",
+        ROUND(lm."Plan YTD"       / NULLIF(t."Plan YTD",       0) * 100, 2) AS "Plan YTD"
+    FROM plan_wtd_mtd lm
+    LEFT JOIN LATERAL (
+        SELECT
+            p2."Plan Last 24hr",
+            p2."Plan WTD",
+            p2."Plan MTD",
+            p2."Plan YTD"
+        FROM plan_wtd_mtd p2
+        WHERE p2.production_day = lm.production_day
+          AND p2.metric = CASE lm.metric
+              WHEN 'Production Ore Li Mass'  THEN 'Production Ore'
+              WHEN 'Development Ore Li Mass' THEN 'Development Ore'
+              WHEN 'OSP Li Mass'             THEN 'OSP'
+              WHEN 'Waste Li Mass'           THEN 'Waste'
+              WHEN 'Total Li Mass'           THEN 'Total Ore Hauled'
+          END
+    ) t ON true
+    WHERE lm.metric IN (
+        'Production Ore Li Mass',
+        'Development Ore Li Mass',
+        'OSP Li Mass',
+        'Waste Li Mass',
+        'Total Li Mass'
