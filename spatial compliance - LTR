@@ -1,0 +1,153 @@
+WITH base AS (
+    SELECT
+        jr.start_time, jr.end_time, jr.dest_material_definition_id, jr.work_master_id,
+        qa.key, ma.material_actual_sk, ma.operational_location, ma.material_use,
+        COALESCE(qa.value_num, 0) AS actual_quantity
+    FROM datamart.job_response jr
+    LEFT JOIN datamart.material_actual ma
+        ON  ma.parent_datamart_sk     = jr.datamart_sk
+        AND ma.material_use           = 'Produced'
+        AND ma.material_definition_id IS NOT NULL
+    LEFT JOIN datamart.quantity qa ON qa.parent_datamart_sk = ma.datamart_sk
+    WHERE jr.work_master_id IN (
+        'Dev Extraction','Prod Extraction','Dev Drilling','Prod Drilling',
+        'Dev Bogging','Sump Bogging','Prod Remote Bogging','ROM Rehandling',
+        'Prod Free Bogging','Roadworks','RaiseBore Drilling','Diamond Drilling',
+        'Prod Blasting','Dev Blasting','Paste Filling'
+    )
+    UNION ALL
+    SELECT
+        jr.start_time, jr.end_time, jr.dest_material_definition_id, jr.work_master_id,
+        qa.key, ma.material_actual_sk, ma.operational_location, ma.material_use,
+        COALESCE(qa.value_num, 0) AS actual_quantity
+    FROM datamart.job_response jr
+    LEFT JOIN datamart.material_actual ma
+        ON  ma.parent_datamart_sk     = jr.datamart_sk
+        AND ma.material_use           = 'Consumed'
+        AND ma.material_definition_id IS NOT NULL
+    LEFT JOIN datamart.quantity qa ON qa.parent_datamart_sk = ma.datamart_sk
+    WHERE jr.work_master_id IN ('Dev Blasting','Prod Blasting')
+),
+ddrilling AS (
+    SELECT DISTINCT ON (b.material_actual_sk)
+        b.start_time, b.end_time, b.work_master_id, b.material_actual_sk,
+        b.operational_location, b.material_use, p.id,
+        CASE
+            WHEN right(upper(trim(b.operational_location)), 3) IN ('DEC','SPD')
+              OR right(upper(trim(b.operational_location)), 4) = 'LINK'
+              OR right(upper(trim(b.operational_location)), 2) = 'PB' THEN 'Cap Dec'
+            WHEN right(upper(trim(b.operational_location)), 2) = 'OD'  THEN 'Op Lat'
+            ELSE 'Cap Lat'
+        END AS dev_type,
+        p.value::numeric AS value
+    FROM base b
+    JOIN dw.property p ON b.material_actual_sk = p.entity_sk AND p.id = 'Advance'
+    WHERE b.work_master_id = 'Dev Drilling'
+    ORDER BY b.material_actual_sk, b.end_time DESC
+),
+pdrilling AS (
+    SELECT
+        b.start_time, b.end_time, b.work_master_id, b.operational_location,
+        b.material_use, b.actual_quantity,
+        CASE WHEN b.operational_location ~ '\d{3}$' THEN 'Prod' ELSE 'Cap' END AS drill_type
+    FROM base b
+    WHERE b.work_master_id = 'Prod Drilling' AND b.key ilike 'holelength'
+),
+otherdrilling AS (
+    SELECT
+        b.start_time, b.end_time, b.work_master_id, b.operational_location,
+        b.material_use, b.actual_quantity
+    FROM base b
+    WHERE b.work_master_id IN ('RaiseBore Drilling') AND b.key ilike 'holelength'
+),
+metrics AS (
+    SELECT date_trunc('day', d.end_time - interval '18 hours')::date AS production_day,
+        d.operational_location,d.work_master_id, d.value
+    FROM ddrilling d
+    UNION ALL
+    SELECT date_trunc('day', p.end_time - interval '18 hours')::date,
+        p.operational_location , p.work_master_id,
+        p.actual_quantity
+    FROM pdrilling p
+    UNION ALL
+    SELECT date_trunc('day', rb.end_time - interval '18 hours')::date,
+        rb.operational_location,rb.work_master_id,
+        rb.actual_quantity
+    FROM otherdrilling rb
+    UNION ALL
+    SELECT date_trunc('day', b.end_time - interval '18 hours')::date,
+        b.operational_location, b.work_master_id, b.actual_quantity
+    FROM base b
+    WHERE b.work_master_id IN (
+        'Dev Bogging','Sump Bogging','Prod Remote Bogging',
+        'ROM Rehandling','Prod Free Bogging','Roadworks'
+    )
+    UNION ALL
+    SELECT date_trunc('day', b.end_time - interval '18 hours')::date,
+        b.operational_location, b.work_master_id, b.actual_quantity
+    FROM base b
+    WHERE b.work_master_id IN ('Dev Blasting','Prod Blasting')
+    UNION ALL
+    SELECT date_trunc('day', b.end_time - interval '18 hours')::date,
+        b.operational_location,
+        CASE WHEN b.work_master_id = 'Paste Filling' THEN 'Paste Pouring'
+             ELSE b.work_master_id END AS metric,
+        b.actual_quantity
+    FROM base b
+    WHERE b.work_master_id IN ('Paste Filling')
+),-- retrieve the lastest schedule version
+ latest_work_schedule AS (
+ SELECT DISTINCT ON (work_schedule_id) *
+    FROM dw.work_schedule
+    ORDER BY work_schedule_id, record_time DESC
+),
+material_requirement_sch AS (
+    SELECT
+        mr.material_use, mr.material_definition_ids[1] AS material_definition_id,
+        mr.material_requirement_sk, mr.storage_location, ws.work_schedule_id,
+        jo.start_time AS order_start_time, jo.end_time AS order_end_time, jo.job_order_sk,
+        ws.start_time, ws.end_time, jo.work_master_id,
+        mr.main_quantity_value_dec AS qty, mr.main_quantity_uom AS uom
+    FROM dw.material_requirement mr
+    LEFT JOIN dw.job_order jo    ON mr.entity_sk = jo.job_order_sk
+    LEFT JOIN dw.work_request wr ON jo.entity_sk = wr.work_request_sk
+    LEFT JOIN  latest_work_schedule ws ON wr.work_schedule_sk = ws.work_schedule_sk
+    WHERE jo.work_master_id IN ('Extraction','Dev Drilling','Prod Drilling','RaiseBore Drilling')
+),
+params AS (
+    SELECT entity_sk,
+        MAX(CASE WHEN id = 'Active'              THEN value END) AS active,
+        MAX(CASE WHEN id = 'SchedID'             THEN value END) AS sched_id,
+        MAX(CASE WHEN id = 'Priority'            THEN value END) AS priority,
+        MAX(CASE WHEN id = 'Lateral Development' THEN value END) AS dev_advance,
+        MAX(CASE WHEN id = 'Dev Type'            THEN value END) AS dev_type,
+        MAX(CASE WHEN id = 'Drilling Type'       THEN value END) AS drill_type
+    FROM dw.parameter
+    WHERE id IN ('Active','SchedID','Priority','Meters','Drilling Type','Dev Type','Lateral Development')
+    GROUP BY entity_sk
+),
+MR_base AS (
+    SELECT
+        p.work_schedule_id, p.start_time, p.end_time,
+        p.material_requirement_sk, p.material_definition_id,
+        p.work_master_id, p.material_use, p.storage_location, p.qty, p.uom,
+        pa.sched_id, pa.active, pa.priority, pa.dev_type, pa.dev_advance, pa.drill_type,
+        t.value    AS haul_type,
+        li2o.value AS haul_grade,
+        li2o.unit_of_measure
+    FROM material_requirement_sch p
+    LEFT JOIN params pa    ON pa.entity_sk = p.job_order_sk
+    LEFT JOIN dw.property t
+        ON t.entity_sk = p.material_requirement_sk AND t.id = 'Type'
+    LEFT JOIN dw.property li2o
+        ON li2o.entity_sk = p.material_requirement_sk AND li2o.id = 'Li2O'
+    WHERE p.storage_location IS NOT NULL
+)
+SELECT
+    p.*,
+    a.*
+FROM MR_base p
+LEFT JOIN metrics a       
+    ON  p.storage_location = a.operational_location 
+    AND p.work_master_id         = a.work_master_id
+ORDER BY a.production_day DESC
