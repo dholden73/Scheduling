@@ -1,88 +1,209 @@
-WITH MR_base AS (
+WITH base AS (
     SELECT
-        mr.material_use,
-        mr.material_class_id,
-        mr.material_definition_id,
-        mr.material_lot_id,
-        mr.parent_entity_sk,
-        mr.storage_location,
-        mr.storage_location_type,
-        mr.schedule_id,
-        mr.schedule_start_time,
-        mr.schedule_end_time,
-        mr.schedule_state,
-        mr.request_id,
-        mr.request_start_time,
-        mr.request_end_time,
-        mr.order_id,
-        mr.order_start_time,
-        mr.order_end_time,
-        mr.work_master_id,
-        mr.mass,
-        ws.record_time
-    FROM datamart.material_requirement mr
-    LEFT JOIN datamart.job_order jo
-      ON mr.parent_entity_sk = jo.job_order_sk
-    LEFT JOIN datamart.work_request wr
-      ON jo.parent_entity_sk = wr.work_request_sk
-    LEFT JOIN datamart.work_schedule ws
-      ON wr.parent_entity_sk = ws.work_schedule_sk
-    where mr.schedule_id ilike 'W%'
-    and mr.work_master_id IN ('Dev Bogging','Prod Remote Bogging,','Dev Drilling','Prod Drilling')		--- Need to add Drilling work masters
-),
-DM_MR AS (
+        jr.start_time, jr.end_time, jr.dest_material_definition_id, jr.work_master_id,
+        qa.key, ma.material_actual_sk, ma.operational_location, ma.material_use,
+        COALESCE(qa.value_num, 0) AS actual_quantity
+    FROM datamart.job_response jr
+    LEFT JOIN datamart.material_actual ma
+        ON  ma.parent_datamart_sk     = jr.datamart_sk
+        AND ma.material_use           = 'Produced'
+        AND ma.material_definition_id IS NOT NULL
+    LEFT JOIN datamart.quantity qa ON qa.parent_datamart_sk = ma.datamart_sk
+    WHERE jr.work_master_id IN (
+        'Dev Extraction','Prod Extraction','Dev Drilling','Prod Drilling',
+        'Dev Bogging','Sump Bogging','Prod Remote Bogging','ROM Rehandling',
+        'Prod Free Bogging','Roadworks','RaiseBore Drilling','Diamond Drilling',
+        'Prod Blasting','Dev Blasting','Paste Filling'
+    )
+    UNION ALL
     SELECT
-        c.request_id,
-        c.schedule_id,
-        c.order_id,
-        c.order_start_time,
-        c.order_end_time,
-        c.work_master_id,
-        -- Source
-        c.material_lot_id AS source_material_lot_id,
-        c.material_definition_id AS source_material_definition_id,
-        c.material_class_id AS source_material_class_id,
-        c.storage_location AS source_storage_location,
-        c.storage_location_type AS source_storage_location_type,
-        --c.hierarchy_scope AS source_hierarchy_scope,
-        --c.hierarchy_scope_path AS source_hierarchy_scope_path,
-        c.mass AS source_mass
-        -- Destination
-        --p.material_lot_id AS dest_material_lot_id,
-        --p.material_definition_id AS dest_material_definition_id,
-        --p.material_class_id AS dest_material_class_id,
-        --p.storage_location AS dest_storage_location,
-        --p.storage_location_type AS dest_storage_location_type,
-        --p.hierarchy_scope AS dest_hierarchy_scope,
-        --p.hierarchy_scope_path AS dest_hierarchy_scope_path,
-        --p.mass AS dest_mass
-    FROM MR_base c
-    WHERE material_use = 'Consumed'
+        jr.start_time, jr.end_time, jr.dest_material_definition_id, jr.work_master_id,
+        qa.key, ma.material_actual_sk, ma.operational_location, ma.material_use,
+        COALESCE(qa.value_num, 0) AS actual_quantity
+    FROM datamart.job_response jr
+    LEFT JOIN datamart.material_actual ma
+        ON  ma.parent_datamart_sk     = jr.datamart_sk
+        AND ma.material_use           = 'Consumed'
+        AND ma.material_definition_id IS NOT NULL
+    LEFT JOIN datamart.quantity qa ON qa.parent_datamart_sk = ma.datamart_sk
+    WHERE jr.work_master_id IN ('Dev Blasting','Prod Blasting')
 ),
-actuals as (
-	select
-		jr.start_time,
-		jr.end_time,
-		jr.job_order_id,
-		jr.source_material_lot_id,
-		jr.source_material_definition_id,
-		jr.dest_material_lot_id,
-		jr.dest_material_definition_id,
-		sum(jr.mass) as actual_tonnes
-	from datamart.job_response jr
-	group by 
-		jr.start_time,
-		jr.end_time,
-		jr.job_order_id,
-		jr.source_material_lot_id,
-		jr.source_material_definition_id,
-		jr.dest_material_lot_id,
-		jr.dest_material_definition_id
+ddrilling AS (
+    SELECT DISTINCT ON (b.material_actual_sk)
+        b.start_time, b.end_time, b.work_master_id, b.material_actual_sk,
+        b.operational_location, b.material_use, p.id,
+        CASE
+            WHEN right(upper(trim(b.operational_location)), 3) IN ('DEC','SPD')
+              OR right(upper(trim(b.operational_location)), 4) = 'LINK'
+              OR right(upper(trim(b.operational_location)), 2) = 'PB' THEN 'Cap Dec'
+            WHEN right(upper(trim(b.operational_location)), 2) = 'OD'  THEN 'Op Lat'
+            ELSE 'Cap Lat'
+        END AS dev_type,
+        p.value::numeric AS value
+    FROM base b
+    JOIN dw.property p ON b.material_actual_sk = p.entity_sk AND p.id = 'Advance'
+    WHERE b.work_master_id = 'Dev Drilling'
+    ORDER BY b.material_actual_sk, b.end_time DESC
+),
+pdrilling AS (
+    SELECT
+        b.start_time, b.end_time, b.work_master_id, b.operational_location,
+        b.material_use, b.actual_quantity,
+        CASE WHEN b.operational_location ~ '\d{3}$' THEN 'Prod' ELSE 'Cap' END AS drill_type
+    FROM base b
+    WHERE b.work_master_id = 'Prod Drilling' AND b.key ilike 'holelength'
+),
+otherdrilling AS (
+    SELECT
+        b.start_time, b.end_time, b.work_master_id, b.operational_location,
+        b.material_use, b.actual_quantity
+    FROM base b
+    WHERE b.work_master_id IN ('RaiseBore Drilling') AND b.key ilike 'holelength'
+),
+metrics as (
+SELECT
+    ((d.end_time AT TIME ZONE 'Australia/Perth') - interval '6 hours')::date AS production_day,
+    d.operational_location,
+    d.work_master_id,
+    d.value
+FROM ddrilling d
+UNION ALL
+SELECT
+    ((p.end_time AT TIME ZONE 'Australia/Perth') - interval '6 hours')::date AS production_day,
+    p.operational_location,
+    p.work_master_id,
+    p.actual_quantity
+FROM pdrilling p
+UNION ALL
+SELECT
+    ((rb.end_time AT TIME ZONE 'Australia/Perth') - interval '6 hours')::date AS production_day,
+    rb.operational_location,
+    rb.work_master_id,
+    rb.actual_quantity
+FROM otherdrilling rb
+),-- retrieve the lastest schedule version
+ latest_work_schedule AS (
+ SELECT DISTINCT ON (work_schedule_id) *
+    FROM dw.work_schedule
+    ORDER BY work_schedule_id, record_time DESC
+),
+material_requirement_sch AS (
+    SELECT
+        mr.material_use, mr.material_definition_ids[1] AS material_definition_id,
+        mr.material_requirement_sk, mr.storage_location, ws.work_schedule_id,
+        jo.start_time AS order_start_time, jo.end_time AS order_end_time, jo.job_order_sk,
+        ws.start_time, ws.end_time, jo.work_master_id,
+        mr.main_quantity_value_dec AS qty, mr.main_quantity_uom AS uom
+    FROM dw.material_requirement mr
+    LEFT JOIN dw.job_order jo    ON mr.entity_sk = jo.job_order_sk
+    LEFT JOIN dw.work_request wr ON jo.entity_sk = wr.work_request_sk
+    LEFT JOIN  latest_work_schedule ws ON wr.work_schedule_sk = ws.work_schedule_sk
+    WHERE mr.material_use           = 'Produced'
+    and jo.work_master_id IN ('Dev Drilling','Prod Drilling','RaiseBore Drilling')
+),
+params AS (
+    SELECT entity_sk,
+        MAX(CASE WHEN id = 'Active'              THEN value END) AS active,
+        MAX(CASE WHEN id = 'SchedID'             THEN value END) AS sched_id,
+        MAX(CASE WHEN id = 'Priority'            THEN value END) AS priority,
+        MAX(CASE WHEN id = 'Lateral Development' THEN value END) AS dev_advance,
+        MAX(CASE WHEN id = 'Dev Type'            THEN value END) AS dev_type,
+        MAX(CASE WHEN id = 'Drilling Type'       THEN value END) AS drill_type
+    FROM dw.parameter
+    WHERE id IN ('Active','SchedID','Priority','Meters','Drilling Type','Dev Type','Lateral Development')
+    GROUP BY entity_sk
+),
+MR_base AS (
+    SELECT
+        p.work_schedule_id, p.start_time, p.end_time,
+        p.material_requirement_sk, p.material_definition_id,
+        p.work_master_id as work_master, p.material_use, p.storage_location, p.qty, p.uom,
+        pa.sched_id, pa.dev_type, pa.dev_advance, pa.drill_type
+    FROM material_requirement_sch p
+    LEFT JOIN params pa    ON pa.entity_sk = p.job_order_sk
+    LEFT JOIN dw.property t
+        ON t.entity_sk = p.material_requirement_sk AND t.id = 'Type'
+),
+planned_raw AS (
+    -- Dev Drilling
+    SELECT d.start_time, d.end_time, d.sched_id,d.storage_location, d.work_master,d.dev_advance::numeric AS qty
+    FROM MR_base d WHERE d.work_master = 'Dev Drilling'
+    UNION ALL
+    --Prod Drilling
+    SELECT p.start_time, p.end_time, p.sched_id, p.storage_location, p.work_master,p.qty
+    FROM MR_base p WHERE p.work_master = 'Prod Drilling'
+    UNION ALL
+    SELECT rb.start_time, rb.end_time,  rb.sched_id,rb.storage_location, rb.work_master, rb.qty
+    FROM MR_base rb WHERE rb.work_master = 'RaiseBore Drilling'
+    ),
+agg_actuals AS (
+    SELECT
+        m.work_master_id,
+        m.operational_location,
+        m.production_day,
+        SUM(m.value) AS actual_qty
+    FROM metrics m
+    GROUP BY m.work_master_id, m.operational_location, m.production_day
+),
+agg_planned AS (
+    SELECT
+        sched_id, start_time, end_time, work_master, storage_location,
+        SUM(qty) AS planned_qty
+    FROM planned_raw
+    GROUP BY sched_id, start_time, end_time, work_master, storage_location
+),
+-- Group at production_day level before applying window functions
+daily_grouped AS (
+    SELECT
+        p.sched_id                          AS work_schedule_id,
+        (p.start_time AT TIME ZONE 'Australia/Perth')::date             AS schedule_start, 
+        (p.end_time   AT TIME ZONE 'Australia/Perth')::date             AS schedule_end, 
+        p.work_master                       AS work_master_id,
+        p.storage_location                  AS location,
+        gs.production_day::date             AS production_day,
+        p.planned_qty,
+        COALESCE(a.actual_qty, 0)           AS daily_qty
+    FROM agg_planned p
+    -- scaffold: one row per day for the full schedule week
+    CROSS JOIN LATERAL generate_series(
+        date_trunc('day', p.start_time AT TIME ZONE 'Australia/Perth')::timestamp,
+        date_trunc('day', p.end_time AT TIME ZONE 'Australia/Perth')::timestamp- INTERVAL '1 day',
+        INTERVAL '1 day'
+    ) AS gs(production_day)
+    -- attach actuals where they exist, zero where they don't
+    LEFT JOIN agg_actuals a
+        ON  a.operational_location  = p.storage_location
+        AND a.work_master_id        = p.work_master
+        AND a.production_day        = gs.production_day
+),
+-- filter to schedule period BEFORE window functions run
+daily_in_period AS (
+    SELECT *
+    FROM daily_grouped
+    WHERE production_day IS NOT NULL
+      AND production_day >= schedule_start   -- exclude any actuals before the schedule week starts
+      AND production_day <= schedule_end
 )
-	SELECT
-		mr.*,
-		a.*
-	from actuals a
-	join DM_MR mr
-	 on a.job_order_id = mr.order_id
-	 
+SELECT
+    work_schedule_id,
+    schedule_start,
+    schedule_end,
+    work_master_id,
+    location as "Location",
+    production_day,
+    planned_qty,
+    daily_qty as "Last 24hr",
+    SUM(daily_qty) OVER (
+        PARTITION BY work_schedule_id, location, work_master_id
+        ORDER BY production_day
+        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    )                                                AS "Achieved",
+    GREATEST(0,
+        planned_qty - SUM(daily_qty) OVER (
+            PARTITION BY work_schedule_id, location, work_master_id
+            ORDER BY production_day
+            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        )
+    )                                                AS "Remaining"
+FROM daily_in_period
+ORDER BY work_master_id, location, production_day desc
