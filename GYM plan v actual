@@ -1,0 +1,385 @@
+WITH current_records_sk AS (
+    SELECT DISTINCT ON (material_lot_id, effective_from_time, effective_to_time)
+        material_lot_id,
+        material_lot_sk,
+        material_definition_id,
+        effective_from_time,
+		effective_to_time,
+		main_quantity_value_dec as qty,
+		is_deleted,
+		record_time,
+		source_system
+    FROM dw.material_lot
+    ORDER BY 
+        material_lot_id,
+        effective_from_time,
+        effective_to_time,
+        record_time       DESC,
+        material_lot_sk   DESC
+),
+ML as (
+	select 
+        ml.material_lot_id,
+        --material_lot_sk,
+        ml.material_definition_id,
+        ml.effective_from_time,
+		ml.effective_to_time,
+		ml.qty as actual_quantity,
+		--is_deleted,
+		ml.record_time,
+		ml.source_system,
+		au.value as au_gpt,
+		'' as operational_location
+		--t.value as contrib
+    FROM current_records_sk  ml
+    LEFT JOIN dw.property au
+        ON au.entity_sk = ml.material_lot_sk AND au.id = 'Au gpt'
+),
+extraction AS (
+    SELECT
+        jr.start_time, jr.end_time, jr.dest_material_definition_id, jr.work_master_id,jr.dest_material_lot_id,
+        qa.key, ma.material_actual_sk, ma.operational_location, ma.material_use,
+        COALESCE(qa.value_num, 0) AS actual_quantity,
+        ml.au_gpt
+    FROM datamart.job_response jr
+    LEFT JOIN datamart.material_actual ma
+        ON ma.parent_datamart_sk = jr.datamart_sk AND ma.material_use = 'Produced' AND ma.material_definition_id IS NOT NULL
+    LEFT JOIN datamart.quantity qa ON qa.parent_datamart_sk = ma.datamart_sk
+   	LEFT JOIN LATERAL (
+    SELECT ml.Au_gpt
+    FROM ML ml
+    WHERE ml.material_lot_id = jr.source_material_lot_id
+    	and ml.effective_from_time <= jr.end_time
+    	and (ml.effective_to_time is null or ml.effective_to_time > jr.end_time)
+    LIMIT 1
+	) ml ON true
+    WHERE jr.work_master_id = 'Extraction'
+  	AND qa.key            = 'volume'
+),
+drilling AS (
+ SELECT
+      -- strip infinities so QuickSight doesn't shit itself
+      CASE WHEN isfinite(jr.start_time) THEN jr.start_time AT TIME ZONE 'utc' END AS start_time,
+      CASE WHEN isfinite(jr.end_time)   THEN jr.end_time   AT TIME ZONE 'utc' END AS end_time,
+      CASE WHEN isfinite(jr.end_time)
+           THEN DATE_TRUNC('day', jr.end_time - INTERVAL '6 hours')::date
+      END AS day,
+      CASE
+          WHEN NOT isfinite(jr.end_time) THEN NULL
+          WHEN EXTRACT(HOUR FROM jr.end_time) >= 6
+           AND EXTRACT(HOUR FROM jr.end_time) <  18 THEN 'Day Shift'
+          ELSE 'Night Shift'
+      END AS shift,
+    jr.work_master_id,
+    ma.operational_location,
+    ma.material_use,
+    COALESCE(qa_meters.value_num, 0)  AS total_drill_meters
+FROM datamart.job_response jr
+LEFT JOIN datamart.material_actual ma
+    ON  ma.parent_datamart_sk     = jr.datamart_sk
+    AND ma.material_use           = 'Produced'
+    AND ma.material_definition_id IS NOT NULL
+LEFT JOIN datamart.quantity qa_meters
+    ON  qa_meters.parent_datamart_sk = ma.datamart_sk
+    AND qa_meters.key                = 'total drilled meters'
+),
+calendar AS (
+    SELECT cal.date, cal.period_start, cal.period_end, cal.day, cal.month, cal.year
+    FROM datamart.cal_days cal
+    WHERE cal.date < date_trunc('year', CURRENT_DATE + interval '1 year')::date
+),
+metrics AS (
+    SELECT ((b.end_time AT TIME ZONE 'Australia/Perth') - interval '6 hours')::date AS production_day,
+        b.operational_location,
+        CASE
+            WHEN b.operational_location like 'OSP%'                                             THEN 'OSP'
+            WHEN b.work_master_id = 'Extraction' AND b.dest_material_definition_id = 'Mixed Waste' and b.dest_material_lot_id like 'WD%'  THEN 'Waste Expit'
+            WHEN b.work_master_id = 'Extraction' AND b.dest_material_definition_id = 'Mixed High Grade' and b.dest_material_lot_id like 'ROM%' THEN 'Ore Expit'
+            ELSE NULL
+        END AS metric,
+        b.actual_quantity AS metric_value
+    FROM extraction b 
+    UNION ALL
+    SELECT ((d.end_time AT TIME ZONE 'Australia/Perth') - interval '6 hours')::date,
+        d.operational_location,
+        case 
+        	when d.work_master_id ='Drillling' then 'Drill Metres'
+        end as metric,
+        d.total_drill_meters
+    FROM drilling d
+    UNION ALL
+    SELECT ((ml.end_time AT TIME ZONE 'Australia/Perth') - interval '6 hours')::date AS production_day,
+        ml.operational_location, 'Mined Ounces',
+        (ml.au_gpt::numeric / 100.0) * ml.actual_quantity
+    FROM extraction ml --WHERE ml.material_definition_id = 'ROM'
+),
+daily_metrics AS (
+    SELECT production_day, metric, SUM(metric_value) AS daily_value
+    FROM metrics WHERE metric IS NOT NULL
+    GROUP BY production_day, metric
+),
+final AS (
+    SELECT production_day, metric, daily_value FROM daily_metrics
+    UNION ALL
+    SELECT production_day, 'Total Expit', SUM(daily_value)
+    FROM daily_metrics WHERE metric IN ('Waste Expit','Ore Expit') GROUP BY production_day
+    UNION ALL
+    SELECT production_day, 'Au oz', SUM(daily_value)
+    FROM daily_metrics
+    GROUP BY production_day
+),
+metric_list AS (
+-- Section header rows: uom = '' is the header flag, fractional order places them first in each group
+    SELECT 'Processing'           AS metric,  0.5  AS metric_order, ''     AS uom
+    UNION ALL SELECT 'Mining',                5.5,                   ''
+    -- Processing
+    UNION ALL SELECT 'Crushed',               1,                     'wt'
+    UNION ALL SELECT 'Milled',                2,                     'dt'
+    UNION ALL SELECT 'Mill Feed Grade',       3,                     'g/t'
+    UNION ALL SELECT 'Recovery',              4,                     '%'
+    UNION ALL SELECT 'AU Recovered',          5,                     'oz'
+    -- Mining
+    UNION ALL SELECT 'Total Expit',           6,                     'bcm'
+    UNION ALL SELECT 'Waste Expit',           7,                     'bcm'
+    UNION ALL SELECT 'Ore Expit',             8,                     'bcm'
+    UNION ALL SELECT 'Drill Metres',          9,                     'm'
+    UNION ALL SELECT 'Mined Ore',             10,                    't'
+    UNION ALL SELECT 'Mined Grade',           11,                    'g/t'
+    UNION ALL SELECT 'Mined Ounces',          12,                    'oz'
+),
+calendar_metrics AS (
+    SELECT
+        c.date, c.day, c.month, c.year,
+        ml.metric, ml.metric_order, ml.uom
+    FROM calendar c
+    CROSS JOIN metric_list ml
+),
+day_wtd_mtd AS (
+    SELECT
+        cm.date AS production_day,
+        cm.month, cm.year, cm.day,
+        cm.metric, cm.uom, cm.metric_order,
+        -- Last 24hr: NULL for headers, raw daily value for data rows
+        CASE WHEN cm.uom = '' THEN NULL
+             ELSE COALESCE(f.daily_value, 0)
+        END AS "Last 24hr",
+        -- WTD: weighted avg for grades, simple cumulative sum for everything else
+        sum
+        (CASE
+           WHEN cm.uom = '' THEN NULL 
+           ELSE COALESCE(f.daily_value, 0) END) OVER wtd_win
+        AS "WTD",
+        -- MTD
+        sum
+        (CASE
+            WHEN cm.uom = '' THEN NULL 
+            ELSE COALESCE(f.daily_value, 0) END) OVER mtd_win
+        AS "MTD",
+        -- YTD
+        sum 
+        (CASE
+            WHEN cm.uom = '' THEN NULL 
+        ELSE COALESCE(f.daily_value, 0) END) OVER ytd_win
+        AS "YTD"
+    FROM calendar_metrics cm
+    LEFT JOIN final f
+        ON  f.production_day = cm.date AND f.metric = cm.metric
+    WINDOW
+        wtd_win AS (
+            PARTITION BY cm.metric,
+                         (date_trunc('week', cm.date - interval '3 days') + interval '3 days')
+            ORDER BY cm.date ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        ),
+        mtd_win AS (
+            PARTITION BY cm.metric, date_trunc('month', cm.date)
+            ORDER BY cm.date ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        ),
+        ytd_win AS (
+            PARTITION BY cm.metric, date_trunc('year', cm.date)
+            ORDER BY cm.date ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        )
+    ORDER BY cm.date DESC, cm.metric_order
+),
+actuals_withgrades AS (
+    -- Non-grade rows pass through unchanged
+    SELECT * FROM day_wtd_mtd
+    WHERE metric <> 'Mined Grade'
+    UNION ALL
+    -- Mined Grade (g/t) = (Mined Ounces * 31.1035) / Mined Ore tonnes
+    -- Using the already-accumulated window totals so WTD/MTD/YTD are properly weighted
+    SELECT
+        oz.production_day,
+        oz.month, oz.year, oz.day,
+        'Mined Grade'                                                             AS metric,
+        'g/t'                                                                     AS uom,
+        11.0                                                                      AS metric_order,
+        ROUND((oz."Last 24hr" * 31.1035) / NULLIF(t."Last 24hr", 0), 2)           AS "Last 24hr",
+        ROUND((oz."WTD"       * 31.1035) / NULLIF(t."WTD",       0), 2)           AS "WTD",
+        ROUND((oz."MTD"       * 31.1035) / NULLIF(t."MTD",       0), 2)           AS "MTD",
+        ROUND((oz."YTD"       * 31.1035) / NULLIF(t."YTD",       0), 2)           AS "YTD"
+    FROM day_wtd_mtd oz
+    LEFT JOIN LATERAL (
+        SELECT t2."Last 24hr", t2."WTD", t2."MTD", t2."YTD"
+        FROM day_wtd_mtd t2
+        WHERE t2.production_day = oz.production_day
+          AND t2.metric         = 'Mined Ore'
+    ) t ON true
+    WHERE oz.metric = 'Mined Ounces'
+),
+planned_raw AS (
+    SELECT
+    	p.work_schedule_id,    
+    	p.sched_start  AS start_time,
+        p.sched_end    AS end_time,
+        p.source_block AS storage_location,
+        CASE
+            WHEN p.dest_location_type = 'Waste' OR p.ore_type = 'Waste'                 THEN 'Waste Expit'
+            WHEN p.ore_type IS NOT NULL AND COALESCE(p.ore_type,'') <> 'Waste'          THEN 'Ore Expit'
+            ELSE NULL
+        END AS metric,
+        p.planned_bcm AS qty
+    FROM cur.sched_job_order_plan p
+    WHERE p.source_block IS NOT NULL
+    UNION ALL
+    -- Mined Ore (tonnes)
+    SELECT
+        p.work_schedule_id, p.sched_start, p.sched_end, p.source_block,
+        'Mined Ore' AS metric,
+        p.planned_bcm
+    FROM cur.sched_job_order_plan p
+    WHERE p.ore_type IS NOT NULL
+      AND p.ore_type <> 'Waste'
+    UNION ALL
+    SELECT
+        p.work_schedule_id, p.sched_start, p.sched_end, p.source_block,
+        'Mined Ounces' AS metric,
+        (p.planned_gold_oz::numeric) AS qty
+    FROM cur.sched_job_order_plan p
+    WHERE p.ore_type IS NOT NULL
+      AND p.ore_type <> 'Waste'
+      AND p.planned_gold_oz IS NOT NULL
+),
+planned_daily AS (
+    SELECT
+        ml.date                   AS production_day,
+        ml.metric,
+        ml.uom,
+        pr.work_schedule_id,
+        SUM(
+            pr.qty / NULLIF(
+                (  (pr.end_time   AT TIME ZONE 'Australia/Perth')::date
+                 - (pr.start_time AT TIME ZONE 'Australia/Perth')::date ), 0
+            )
+        ) AS daily_plan
+    FROM calendar_metrics ml
+    left JOIN planned_raw pr
+      ON ml.date >= (pr.start_time AT TIME ZONE 'Australia/Perth')::date
+     AND ml.date <  (pr.end_time   AT TIME ZONE 'Australia/Perth')::date
+    GROUP BY ml.date, pr.work_schedule_id, pr.metric, ml.metric, ml.uom
+),
+planned_final AS (
+    SELECT production_day, work_schedule_id, metric, daily_plan, uom
+    FROM planned_daily
+    UNION ALL
+    SELECT production_day, work_schedule_id, 'Total Expit', SUM(daily_plan),uom
+    FROM planned_daily
+    WHERE metric IN ('Waste Expit','Ore Expit')
+    GROUP BY production_day, work_schedule_id,uom
+),
+plan_wtd_mtd AS (
+    SELECT
+        pf.production_day,
+        pf.work_schedule_id,
+        pf.metric,
+        pf.uom,
+        pf.daily_plan                          AS "Plan Last 24hr",
+        SUM(pf.daily_plan) OVER plan_wtd_win   AS "Plan WTD",
+        SUM(pf.daily_plan) OVER plan_mtd_win   AS "Plan MTD",
+        SUM(pf.daily_plan) OVER plan_ytd_win   AS "Plan YTD"
+    FROM planned_final pf
+    WINDOW
+        plan_wtd_win AS (
+            PARTITION BY pf.metric, pf.work_schedule_id, date_trunc('week',  pf.production_day)
+            ORDER BY pf.production_day ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        ),
+        plan_mtd_win AS (
+            PARTITION BY pf.metric, pf.work_schedule_id, date_trunc('month', pf.production_day)
+            ORDER BY pf.production_day ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        ),
+        plan_ytd_win AS (
+            PARTITION BY pf.metric, pf.work_schedule_id, date_trunc('year',  pf.production_day)
+            ORDER BY pf.production_day ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        )
+),
+planned_withgrades AS (
+    SELECT * FROM plan_wtd_mtd
+    WHERE metric <> 'Mined Grade'
+    UNION ALL
+    SELECT
+        oz.production_day,
+        oz.work_schedule_id,
+        'Mined Grade' AS metric,
+        'g/t'         AS uom,
+        ROUND((oz."Plan Last 24hr" * 31.1035) / NULLIF(t."Plan Last 24hr", 0), 2) AS "Plan Last 24hr",
+        ROUND((oz."Plan WTD"       * 31.1035) / NULLIF(t."Plan WTD",       0), 2) AS "Plan WTD",
+        ROUND((oz."Plan MTD"       * 31.1035) / NULLIF(t."Plan MTD",       0), 2) AS "Plan MTD",
+        ROUND((oz."Plan YTD"       * 31.1035) / NULLIF(t."Plan YTD",       0), 2) AS "Plan YTD"
+    FROM plan_wtd_mtd oz
+    LEFT JOIN LATERAL (
+        SELECT t2."Plan Last 24hr", t2."Plan WTD", t2."Plan MTD", t2."Plan YTD"
+        FROM plan_wtd_mtd t2
+        WHERE t2.production_day   = oz.production_day
+          AND t2.metric           = 'Mined Ore'
+          AND t2.work_schedule_id IS NOT DISTINCT FROM oz.work_schedule_id
+    ) t ON TRUE
+    WHERE oz.metric = 'Mined Ounces'
+)
+SELECT
+    a.production_day,
+    a.month, a.year, a.day,
+    p.work_schedule_id, 
+    a.metric,
+    a.metric_order,
+    a.uom,
+    CASE
+        WHEN a.metric IN ('Processing','Mining') THEN 'Section Header'
+        WHEN a.metric = 'Total Expit'            THEN 'Total'
+        ELSE 'Normal'
+    END AS display_style,
+    a."Last 24hr", a."WTD", a."MTD", a."YTD",
+    p."Plan Last 24hr", p."Plan WTD", p."Plan MTD", p."Plan YTD",
+    a."Last 24hr" - COALESCE(p."Plan Last 24hr", 0) AS "Var Last 24hr",
+    a."WTD"       - COALESCE(p."Plan WTD",        0) AS "Var WTD",
+    a."MTD"       - COALESCE(p."Plan MTD",        0) AS "Var MTD",
+    CASE
+        WHEN a."Last 24hr" > COALESCE(p."Plan Last 24hr", 0) THEN 'Above Plan'
+        WHEN a."Last 24hr" < COALESCE(p."Plan Last 24hr", 0) THEN 'Below Plan'
+        ELSE 'On Target'
+    END AS "Var Last 24hr Color",
+    CASE
+        WHEN a."WTD" > COALESCE(p."Plan WTD", 0) THEN 'Above Plan'
+        WHEN a."WTD" < COALESCE(p."Plan WTD", 0) THEN 'Below Plan'
+        ELSE 'On Target'
+    END AS "Var WTD Color",
+    CASE
+        WHEN a."MTD" > COALESCE(p."Plan MTD", 0) THEN 'Above Plan'
+        WHEN a."MTD" < COALESCE(p."Plan MTD", 0) THEN 'Below Plan'
+        ELSE 'On Target'
+    END AS "Var MTD Color",
+    TO_CHAR(a."Last 24hr",                                    CASE WHEN a.uom IN ('g/t','%') THEN 'FM999990.00' ELSE 'FM999,999,990' END) AS "Last 24hr Display",
+    TO_CHAR(a."WTD",                                          CASE WHEN a.uom IN ('g/t','%') THEN 'FM999990.00' ELSE 'FM999,999,990' END) AS "WTD Display",
+    TO_CHAR(a."MTD",                                          CASE WHEN a.uom IN ('g/t','%') THEN 'FM999990.00' ELSE 'FM999,999,990' END) AS "MTD Display",
+    TO_CHAR(a."YTD",                                          CASE WHEN a.uom IN ('g/t','%') THEN 'FM999990.00' ELSE 'FM999,999,990' END) AS "YTD Display",
+    TO_CHAR(p."Plan Last 24hr",                               CASE WHEN a.uom IN ('g/t','%') THEN 'FM999990.00' ELSE 'FM999,999,990' END) AS "Plan Last 24hr Display",
+    TO_CHAR(p."Plan WTD",                                     CASE WHEN a.uom IN ('g/t','%') THEN 'FM999990.00' ELSE 'FM999,999,990' END) AS "Plan WTD Display",
+    TO_CHAR(p."Plan MTD",                                     CASE WHEN a.uom IN ('g/t','%') THEN 'FM999990.00' ELSE 'FM999,999,990' END) AS "Plan MTD Display",
+    TO_CHAR(p."Plan YTD",                                     CASE WHEN a.uom IN ('g/t','%') THEN 'FM999990.00' ELSE 'FM999,999,990' END) AS "Plan YTD Display",
+    TO_CHAR(a."Last 24hr" - COALESCE(p."Plan Last 24hr", 0),  CASE WHEN a.uom IN ('g/t','%') THEN 'FM999990.00' ELSE 'FM999,999,990' END) AS "Var Last 24hr Display",
+    TO_CHAR(a."WTD"       - COALESCE(p."Plan WTD",        0), CASE WHEN a.uom IN ('g/t','%') THEN 'FM999990.00' ELSE 'FM999,999,990' END) AS "Var WTD Display",
+    TO_CHAR(a."MTD"       - COALESCE(p."Plan MTD",        0), CASE WHEN a.uom IN ('g/t','%') THEN 'FM999990.00' ELSE 'FM999,999,990' END) AS "Var MTD Display"
+FROM actuals_withgrades a
+LEFT JOIN planned_withgrades p
+    ON  a.production_day = p.production_day
+    AND a.metric         = p.metric
+where a.month = 4
+ORDER BY a.production_day DESC, a.metric_order
