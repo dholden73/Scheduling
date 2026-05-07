@@ -1,0 +1,72 @@
+WITH equipment_scope AS (
+  SELECT DISTINCT
+    eq.equipment_id,
+    eq.equipment_class_id,
+    p.value AS equipment_fleet_id
+  FROM datamart.equipment eq
+  LEFT JOIN datamart.property p
+    ON p.parent_datamart_sk = eq.datamart_sk
+   AND p.property_id = 'Operational Group'
+),
+cal AS (
+  SELECT
+    (period_start AT TIME ZONE 'UTC') AS period_start_utc,
+    (period_end   AT TIME ZONE 'UTC') AS period_end_utc,
+    CASE
+      WHEN shift_name = 'Day Shift'   THEN 'DS'
+      WHEN shift_name = 'Night Shift' THEN 'NS'
+      ELSE NULL
+    END AS shift_name,
+    date::date AS shift_date
+  FROM datamart.cal_shifts
+  WHERE period_end >= (now() - interval '30 days')
+),
+bounds AS (
+  SELECT min(period_start_utc) AS min_ts,
+         max(period_end_utc)   AS max_ts
+  FROM cal
+),
+jobs AS (
+  SELECT
+    jr.work_master_id,
+    jr.excavator_id AS equipment_id,
+    es.equipment_class_id,
+    es.equipment_fleet_id,
+    jr.mass,
+    COALESCE(jr.end_time, jr.start_time) AS prod_time
+  FROM datamart.job_response jr
+  JOIN equipment_scope es
+    ON es.equipment_id = jr.excavator_id
+  WHERE jr.mass IS NOT NULL
+    AND jr.excavator_id IS NOT NULL
+  UNION ALL
+  SELECT
+    jr.work_master_id,
+    jr.truck_id AS equipment_id,
+    es.equipment_class_id,
+    es.equipment_fleet_id,
+    jr.mass,
+    COALESCE(jr.end_time, jr.start_time) AS prod_time
+  FROM datamart.job_response jr
+  JOIN equipment_scope es
+    ON es.equipment_id = jr.truck_id
+  WHERE jr.mass IS NOT NULL
+    AND jr.truck_id IS NOT NULL
+)
+  SELECT
+    c.period_start_utc AS period_start,
+    c.period_end_utc   AS period_end,
+    c.shift_name,
+    c.shift_date,
+    j.work_master_id,
+    j.equipment_id,
+    j.equipment_fleet_id,
+    j.equipment_class_id,
+    SUM(j.mass) AS tonnes
+  FROM cal c
+  LEFT JOIN jobs j
+    ON j.prod_time >= c.period_start_utc
+   AND j.prod_time <  c.period_end_utc
+  GROUP BY
+    c.period_start_utc, c.period_end_utc, c.shift_name, c.shift_date,
+    j.work_master_id, j.equipment_id, j.equipment_fleet_id, j.equipment_class_id
