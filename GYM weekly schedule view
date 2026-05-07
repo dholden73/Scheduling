@@ -1,0 +1,100 @@
+WITH plan_agg AS (
+  SELECT
+    source_block,
+    MAX(dest_storage_location)   AS planned_dest,
+    MAX(dest_location_type)      AS dest_type,
+    MAX(grade_type)              AS grade_type,
+    MAX(ore_type)                AS ore_type,
+    COUNT(*)                     AS job_orders,
+    SUM(planned_mass_t)          AS planned_t,
+    MAX(num_excavators_sched)    AS excav_sched,
+    ROUND(AVG(avg_trucks_sched)::numeric, 1) AS avg_trucks_sched,
+    MIN(sched_start)             AS w_start,
+    MAX(sched_end)               AS w_end
+  FROM cur.sched_job_order_plan
+  WHERE source_block IS NOT NULL
+  GROUP BY source_block
+),
+actual_agg AS (
+  SELECT
+    source_block_prefix,
+    SUM(actual_t)                AS actual_t,
+    COUNT(*)                     AS actual_cycles,
+    COUNT(DISTINCT excavator_id) FILTER (WHERE excavator_id IS NOT NULL) AS actual_excavators,
+    COUNT(DISTINCT truck_id)     FILTER (WHERE truck_id IS NOT NULL) AS actual_trucks,
+    STRING_AGG(DISTINCT truck_id::text, ', ' ORDER BY truck_id::text)
+      FILTER (WHERE truck_id IS NOT NULL) AS truck_ids,
+    STRING_AGG(DISTINCT dest_lot, ', ' ORDER BY dest_lot)
+      FILTER (WHERE dest_lot IS NOT NULL) AS actual_dests
+  FROM cur.sched_actual_cycles
+  WHERE start_time BETWEEN (SELECT MIN(w_start) FROM plan_agg) AND (SELECT MAX(w_end) FROM plan_agg)
+    AND source_lot IS NOT NULL
+  GROUP BY source_block_prefix
+),
+actual_matched AS (
+  SELECT
+    p.source_block,
+    SUM(aa.actual_t)          AS actual_t,
+    SUM(aa.actual_cycles)     AS actual_cycles,
+    MAX(aa.actual_excavators) AS actual_excavators,
+    STRING_AGG(DISTINCT aa.actual_dests, ', ')
+      FILTER (WHERE aa.actual_dests IS NOT NULL) AS actual_dests
+  FROM plan_agg p
+  JOIN actual_agg aa ON aa.source_block_prefix LIKE p.source_block || '%'
+  GROUP BY p.source_block
+),
+truck_per_block AS (
+  SELECT
+    p.source_block,
+    COUNT(DISTINCT a.truck_id) FILTER (WHERE a.truck_id IS NOT NULL) AS actual_trucks,
+    STRING_AGG(DISTINCT a.truck_id::text, ', ' ORDER BY a.truck_id::text)
+      FILTER (WHERE a.truck_id IS NOT NULL) AS truck_ids
+  FROM plan_agg p
+  JOIN cur.sched_actual_cycles a
+    ON  a.source_lot LIKE p.source_block || '%'
+    AND a.start_time BETWEEN p.w_start AND p.w_end
+  GROUP BY p.source_block
+),
+unmatched_actuals AS (
+  SELECT aa.*
+  FROM actual_agg aa
+  WHERE NOT EXISTS (
+    SELECT 1 FROM plan_agg p WHERE aa.source_block_prefix LIKE p.source_block || '%'
+  )
+)
+SELECT
+  p.source_block                                                AS "Source Block",
+  p.grade_type                                                  AS "Grade",
+  p.ore_type                                                    AS "Ore Type",
+  p.planned_dest                                                AS "Planned Dest",
+  p.job_orders                                                  AS "Job Orders",
+  ROUND(p.planned_t)::bigint                                    AS "Planned (t)",
+  ROUND(am.actual_t)::bigint                                    AS "Actual (t)",
+  ROUND(am.actual_t / NULLIF(p.planned_t, 0) * 100, 1)         AS "Tonnage %",
+  p.excav_sched                                                 AS "Excav Sched",
+  am.actual_excavators                                          AS "Excav Actual",
+  p.avg_trucks_sched                                            AS "Trucks Sched",
+  tb.actual_trucks                                              AS "Trucks Actual",
+  tb.truck_ids                                                  AS "Truck IDs",
+  am.actual_dests                                               AS "Actual Destinations"
+FROM plan_agg p
+LEFT JOIN actual_matched am  ON am.source_block = p.source_block
+LEFT JOIN truck_per_block tb ON tb.source_block = p.source_block
+UNION ALL
+SELECT
+  ua.source_block_prefix                                        AS "Source Block",
+  NULL                                                          AS "Grade",
+  NULL                                                          AS "Ore Type",
+  NULL                                                          AS "Planned Dest",
+  NULL::bigint                                                  AS "Job Orders",
+  NULL::bigint                                                  AS "Planned (t)",
+  ROUND(ua.actual_t)::bigint                                    AS "Actual (t)",
+  NULL::numeric                                                 AS "Tonnage %",
+  NULL                                                          AS "Excav Sched",
+  ua.actual_excavators                                          AS "Excav Actual",
+  NULL::numeric                                                 AS "Trucks Sched",
+  ua.actual_trucks                                              AS "Trucks Actual",
+  ua.truck_ids                                                  AS "Truck IDs",
+  ua.actual_dests                                               AS "Actual Destinations"
+FROM unmatched_actuals ua
+ORDER BY "Planned (t)" DESC NULLS LAST, "Actual (t)" DESC
