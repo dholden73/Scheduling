@@ -1,0 +1,69 @@
+WITH latest_work_schedule AS (
+    SELECT DISTINCT ON (work_schedule_id) *
+    FROM dw.work_schedule
+    ORDER BY work_schedule_id, record_time DESC
+),
+jobs AS (
+    SELECT
+        mr.material_use,
+        mr.material_definition_ids[1] AS material_definition_id,
+        mr.material_requirement_sk,
+        mr.storage_location,
+        mr.material_lot_ids[1] as material_lot_id,
+        ws.work_schedule_id,
+        jo.start_time AS order_start_time,
+        jo.end_time   AS order_end_time,
+        jo.job_order_sk,
+        jo.job_order_id,
+        ws.start_time,
+        ws.end_time,
+        jo.work_master_id,
+        mr.main_quantity_uom AS uom,
+        mr.ingestion_reference_sk
+    FROM dw.material_requirement mr
+    LEFT JOIN dw.job_order jo            ON mr.entity_sk        = jo.job_order_sk
+    LEFT JOIN dw.work_request wr         ON jo.entity_sk        = wr.work_request_sk
+    LEFT JOIN latest_work_schedule ws    ON wr.work_schedule_sk = ws.work_schedule_sk
+),
+properties AS (
+    SELECT
+        entity_sk,
+        MAX(CASE WHEN id = 'GradeType' THEN value END)          AS grade_type,
+        MAX(CASE WHEN id = 'Moisture'  THEN value::numeric END) AS moisture,
+        MAX(CASE WHEN id = 'Flitch'    THEN value END)          AS flitch,
+        MAX(CASE WHEN id = 'Au gpt'    THEN value::numeric END) AS au_gpt
+    FROM dw.property
+    WHERE property_type LIKE 'OpMaterialRequirementPropertyType.ValueType'
+    GROUP BY entity_sk
+),
+quantities AS (
+    SELECT
+        ingestion_reference_sk,
+        MAX(CASE WHEN key = 'mass'                THEN value_num END) AS mass,
+        MAX(CASE WHEN key = 'mass_au'             THEN value_num END) AS mass_au,
+        MAX(CASE WHEN key = 'mass_au_oz'          THEN value_num END) AS mass_au_oz,
+        MAX(CASE WHEN key = 'mass_g'              THEN value_num END) AS mass_g,
+        MAX(CASE WHEN key = 'mass_oz'             THEN value_num END) AS mass_oz,
+        MAX(CASE WHEN key = 'mass_wet'            THEN value_num END) AS mass_wet,
+        MAX(CASE WHEN key = 'volume'              THEN value_num END) AS volume
+    FROM datamart.quantity
+    GROUP BY ingestion_reference_sk
+)
+SELECT
+    j.*,
+    q.mass,
+    q.mass_au,
+    q.mass_au_oz,
+    q.mass_g,
+    q.mass_oz,
+    q.mass_wet,
+    q.volume,
+    p.grade_type,
+    p.moisture,
+    p.flitch,
+    p.au_gpt
+FROM jobs j
+LEFT JOIN quantities q ON q.ingestion_reference_sk = j.ingestion_reference_sk
+LEFT JOIN properties p ON p.entity_sk              = j.material_requirement_sk
+WHERE j.material_definition_id = 'Excavation Zone'
+ORDER BY j.job_order_id DESC;
