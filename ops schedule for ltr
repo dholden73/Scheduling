@@ -1,5 +1,5 @@
 -- retrieve the latest schedule version
-with latest_work_schedule AS (
+with latest_operations_schedule AS (
     SELECT DISTINCT ON (operations_schedule_id) *
     FROM dw.operations_schedule
     ORDER BY operations_schedule_id, record_time DESC
@@ -13,7 +13,7 @@ material_requirement_sch AS (
     FROM dw.segment_requirement sr
     left join dw.material_requirement mr on mr.entity_sk = sr.segment_requirement_sk
     LEFT JOIN dw.operations_request wr ON sr.operations_request_sk = wr.operations_request_sk
-    LEFT JOIN dw.operations_schedule ws ON wr.operations_schedule_sk = ws.operations_schedule_sk
+    LEFT JOIN latest_operations_schedule ws ON wr.operations_schedule_sk = ws.operations_schedule_sk
     --and jo.work_master_id IN ('Extraction','Dev Drilling','Prod Drilling','RaiseBore Drilling','Diamond Drilling','Paste Filling')
 ),
 params AS (
