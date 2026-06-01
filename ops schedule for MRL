@@ -1,0 +1,94 @@
+WITH cross_calendar AS (
+  SELECT *, wm.wm as work_master_id
+  FROM datamart.cal_prod_days cal
+  CROSS JOIN (
+    SELECT DISTINCT work_master_id as wm FROM datamart.job_response
+    UNION 
+    SELECT DISTINCT operations_definition_id AS wm FROM datamart.material_requirement_op
+  ) wm
+  where cal.year=EXTRACT(YEAR FROM <<$ReportingDate>>) and cal.month=EXTRACT(MONTH FROM <<$ReportingDate>>)
+),
+
+planned AS (
+  SELECT
+    c.production_day,
+    c.work_master_id,
+    p.operations_schedule_id,
+    SUM(
+      COALESCE(qp.value_num, 0) *
+      EXTRACT(EPOCH FROM (LEAST(p.latest_end_time, c.period_end) - GREATEST(p.earliest_start_time, c.period_start))) /
+      NULLIF(EXTRACT(EPOCH FROM (p.latest_end_time - p.earliest_start_time)), 0)
+    ) AS planned_quantity
+  FROM cross_calendar c
+  LEFT JOIN datamart.material_requirement_op p
+    ON p.operations_definition_id = c.work_master_id
+   AND p.latest_end_time  >  c.period_start 
+   AND p.earliest_start_time <  c.period_end
+  LEFT JOIN datamart.quantity qp 
+    ON qp.parent_datamart_sk = p.datamart_sk
+   AND qp.key = CASE 
+      WHEN p.operations_definition_id = 'Blasthole Drilling' THEN 'length' 
+      ELSE 'mass'
+    END
+  GROUP BY c.production_day, c.work_master_id, p.operations_schedule_id
+),
+
+actual AS (
+  SELECT
+    c.production_day,
+    c.work_master_id,
+    SUM(COALESCE(qa.value_num, 0)) AS actual_quantity
+  FROM cross_calendar c
+  JOIN datamart.job_response a
+    ON a.work_master_id = c.work_master_id
+   AND a.end_time >= c.period_start
+   AND a.end_time <  c.period_end
+  JOIN datamart.material_actual ma
+    ON ma.parent_datamart_sk = a.datamart_sk
+  JOIN datamart.quantity qa
+    ON qa.parent_datamart_sk = ma.datamart_sk
+   AND qa.key = CASE 
+    WHEN a.work_master_id = 'Blasthole Drilling' THEN 'totalmetercount' 
+    WHEN a.work_master_id = 'Explosive Loading' THEN 'total_anfo' 
+    ELSE 'mass'
+  END
+  where 
+    ma.material_use = CASE 
+        WHEN a.work_master_id in ('Blasthole Drilling', 'Explosive Loading') THEN 'Produced' 
+        ELSE 'Consumed'
+    END
+  GROUP BY c.production_day, c.work_master_id
+),
+
+joined AS (
+  SELECT 
+    c.production_day,
+    MIN(c.period_start) AS period_start,
+    MAX(c.period_end) AS period_end,
+    c.work_master_id AS operations_definition_id,
+    p.operations_schedule_id,
+    SUM(COALESCE(p.planned_quantity, 0)) AS planned_quantity,
+    SUM(COALESCE(a.actual_quantity, 0)) AS actual_quantity
+  FROM cross_calendar c
+  LEFT JOIN planned p
+    ON p.production_day = c.production_day AND p.work_master_id = c.work_master_id
+  LEFT JOIN actual a
+    ON a.production_day = c.production_day AND a.work_master_id = c.work_master_id
+  GROUP BY c.production_day, c.work_master_id, p.operations_schedule_id
+)
+
+SELECT *,
+  SUM(planned_quantity) OVER (
+    PARTITION BY operations_definition_id
+    ORDER BY production_day
+    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+  ) AS running_planned_quantity,
+
+  SUM(actual_quantity) OVER (
+    PARTITION BY operations_definition_id
+    ORDER BY production_day
+    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+  ) AS running_actual_quantity
+
+FROM joined
+ORDER BY production_day, operations_definition_id, operations_schedule_id
