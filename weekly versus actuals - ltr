@@ -1,17 +1,74 @@
-WITH base AS (
+WITH metric_list AS (
+    SELECT 'Hauling'             AS metric,  5.5  AS metric_order, ''   AS uom
+    UNION ALL SELECT 'Development',          14.5,                 ''
+    UNION ALL SELECT 'Drilling',              0.5,                 ''
+    UNION ALL SELECT 'Backfill',             18.5,                 ''
+    UNION ALL SELECT 'Production Ore',        6,    't'
+    UNION ALL SELECT 'Production Ore Grade',  7,    '%'
+    UNION ALL SELECT 'Development Ore',        8,   't'
+    UNION ALL SELECT 'Development Ore Grade', 9,    '%'
+    UNION ALL SELECT 'Total Ore Hauled',      10,   't'
+    UNION ALL SELECT 'Total Ore Grade',       10.5, '%'
+    UNION ALL SELECT 'OSP',                   11,   't'
+    UNION ALL SELECT 'OSP Grade',             12,   '%'
+    UNION ALL SELECT 'Waste',                 13,   't'
+    UNION ALL SELECT 'Total Haulage',         14,   't'
+    UNION ALL SELECT 'Haulage Production Ore',      98,  't'
+    UNION ALL SELECT 'Haulage Development Ore',     99,  't'
+    UNION ALL SELECT 'Haulage Total Ore Hauled',   100,  't'
+    UNION ALL SELECT 'Haulage OSP',                101,  't'
+    UNION ALL SELECT 'Decline',              15,    'm'
+    UNION ALL SELECT 'Capital',              16,    'm'
+    UNION ALL SELECT 'Operating',            17,    'm'
+    UNION ALL SELECT 'Total Development',    18,    'm'
+    UNION ALL SELECT 'Production Drilling',   1,    'm'
+    UNION ALL SELECT 'Capital Drilling',      2,    'm'
+    UNION ALL SELECT 'Total Longhole',         3,    'm'
+    UNION ALL SELECT 'Rhino Rising',           4,    'm'
+    UNION ALL SELECT 'Diamond Drilling',       5,    'm'
+    UNION ALL SELECT 'Paste Pouring',         19,   'm3'
+    UNION ALL SELECT 'Dev Bogging',           20,    't'
+    UNION ALL SELECT 'Sump Bogging',          21,    't'
+    UNION ALL SELECT 'Prod Remote Bogging',   22,    't'
+    UNION ALL SELECT 'ROM Rehandling',        23,    't'
+    UNION ALL SELECT 'Prod Free Bogging',     24,    't'
+    UNION ALL SELECT 'Roadworks',             25,    'm'
+    UNION ALL SELECT 'Prod Blasting',         26,    't'
+    UNION ALL SELECT 'Dev Blasting',          27,    't'
+    UNION ALL SELECT 'Development Ore Li Mass', 28,  't'
+    UNION ALL SELECT 'Production Ore Li Mass',  29,  't'
+    UNION ALL SELECT 'OSP Li Mass',             30,  't'
+    UNION ALL SELECT 'Total Li Mass',           31,  't'
+),
+calendar AS (
+    SELECT cal.date, cal.period_start, cal.period_end, cal.day, cal.month, cal.year
+    FROM datamart.cal_days cal
+    WHERE cal.date < date_trunc('year', CURRENT_DATE + interval '1 year')::date
+),
+calendar_metrics AS (
+    SELECT c.date, c.day, c.month, c.year, ml.metric, ml.metric_order, ml.uom
+    FROM calendar c
+    CROSS JOIN metric_list ml
+),
+-- -------------------------------------------------------
+-- Actuals
+-- -------------------------------------------------------
+base AS (
     SELECT
+        date_trunc('day', (jr.start_time::timestamptz AT TIME ZONE 'Australia/Perth') - interval '6 hours')::date AS production_day,
         jr.start_time, jr.end_time, jr.dest_material_definition_id, jr.work_master_id,
-        qa.key, ma.material_actual_sk, ma.operational_location, ma.material_use,
+        qa.key, ma.material_actual_sk, ma.operational_location, ma.material_use,jr.job_response_sk,
         COALESCE(qa.value_num, 0) AS actual_quantity
     FROM datamart.job_response jr
     LEFT JOIN datamart.material_actual ma
         ON ma.parent_datamart_sk = jr.datamart_sk AND ma.material_use = 'Produced' AND ma.material_definition_id IS NOT NULL
     LEFT JOIN datamart.quantity qa ON qa.parent_datamart_sk = ma.datamart_sk
-    WHERE jr.work_master_id IN ('Dev Extraction','Prod Extraction','Dev Drilling','Prod Drilling','Dev Bogging','Sump Bogging','Prod Remote Bogging','ROM Rehandling','Prod Free Bogging','Roadworks','RaiseBore Drilling','Diamond Drilling','Prod Blasting','Dev Blasting','Paste Filling')
+    WHERE jr.work_master_id IN ('Dev Extraction','Prod Extraction','Dev Drilling','Prod Drilling','Dev Bogging','Sump Bogging','Prod Remote Bogging','ROM Rehandling','Prod Free Bogging','Roadworks','RaiseBore Drilling','Diamond Drilling','Paste Filling')
     UNION ALL
     SELECT
+        date_trunc('day', (jr.start_time::timestamptz AT TIME ZONE 'Australia/Perth') - interval '6 hours')::date AS production_day,
         jr.start_time, jr.end_time, jr.dest_material_definition_id, jr.work_master_id,
-        qa.key, ma.material_actual_sk, ma.operational_location, ma.material_use,
+        qa.key, ma.material_actual_sk, ma.operational_location, ma.material_use,jr.job_response_sk,
         COALESCE(qa.value_num, 0) AS actual_quantity
     FROM datamart.job_response jr
     LEFT JOIN datamart.material_actual ma
@@ -21,8 +78,8 @@ WITH base AS (
 ),
 ddrilling AS (
     SELECT DISTINCT ON (b.material_actual_sk)
-        b.start_time, b.end_time, b.work_master_id, b.material_actual_sk,
-        b.operational_location, b.material_use, p.id,
+        b.production_day, b.work_master_id, b.material_actual_sk,
+        b.operational_location, b.material_use, p.property_id,
         CASE
             WHEN right(upper(trim(b.operational_location)), 3) IN ('DEC','SPD')
               OR right(upper(trim(b.operational_location)), 4) = 'LINK'
@@ -32,12 +89,13 @@ ddrilling AS (
         END AS dev_type,
         p.value::numeric AS value
     FROM base b
-    JOIN dw.property p ON b.material_actual_sk = p.entity_sk AND p.id = 'Advance'
+    JOIN datamart.property p ON  b.material_actual_sk = p.parent_entity_sk AND p.property_id = 'Advance'
     WHERE b.work_master_id = 'Dev Drilling'
     ORDER BY b.material_actual_sk, b.end_time DESC
 ),
 pdrilling AS (
-    SELECT b.start_time, b.end_time, b.work_master_id, b.operational_location,
+    SELECT
+        b.production_day, b.work_master_id, b.operational_location,
         b.material_use, b.actual_quantity,
         CASE WHEN b.operational_location ~ '\d{3}$' THEN 'Prod' ELSE 'Cap' END AS drill_type
     FROM base b
@@ -45,77 +103,51 @@ pdrilling AS (
     ORDER BY b.end_time DESC
 ),
 otherdrilling AS (
-    SELECT b.start_time, b.end_time, b.work_master_id, b.operational_location,
+    SELECT
+        b.production_day, b.work_master_id, b.operational_location,
         b.material_use, b.actual_quantity
     FROM base b
+    JOIN datamart.property p ON  b.job_response_sk = p.parent_entity_sk AND p.value ilike '%boxcut%'
     WHERE b.work_master_id IN ('RaiseBore Drilling') AND b.key ilike 'holelength'
     ORDER BY b.end_time DESC
 ),
--- Haulage grades and diamond drilling actuals
 current_records_sk AS (
-    SELECT DISTINCT ON (ma.material_lot_id) 
-        material_lot_id,
-        material_lot_sk,
-        material_definition_id,
-        effective_from_time,
-		effective_to_time,
-		main_quantity_value_dec as qty,
-		is_deleted,
-		record_time,
-		source_system
-    FROM dw.material_lot ma
-    ORDER BY 
-        ma.material_lot_id,  -- DISTINCT ON key
-        ma.record_time DESC,
-        ma.material_lot_sk DESC
+    SELECT DISTINCT ON (material_lot_id, effective_from_time, effective_to_time)
+        material_lot_id, material_lot_sk, material_definition_id,
+        effective_from_time, effective_to_time,
+        main_quantity_value_dec AS qty,
+        is_deleted, record_time, source_system
+    FROM dw.material_lot
+    ORDER BY material_lot_id, effective_from_time, effective_to_time, record_time DESC, material_lot_sk DESC
 ),
-ML as (
-	select 
-        ml.material_lot_id,
-        --material_lot_sk,
-        ml.material_definition_id,
-        ml.effective_from_time,
-		ml.effective_to_time,
-		ml.qty as actual_quantity,
-		--is_deleted,
-		ml.record_time,
-		ml.source_system,
-		li2O.value as liO2,
-		'' as operational_location,
-		t.value as contrib
-    FROM current_records_sk  ml
-    LEFT JOIN dw.property t
-        ON t.entity_sk = ml.material_lot_sk AND t.key = 'Contributor'
-    LEFT JOIN dw.property li2o
-        ON li2o.entity_sk = ml.material_lot_sk AND li2o.id = 'Li2O'
- where ml.material_definition_id in ('Contaminated ROM','ROM','Core Hole')
-),
-calendar AS (
-    SELECT cal.date, cal.period_start, cal.period_end, cal.day, cal.month, cal.year,
-        CASE cal.month
-            WHEN 1 THEN 'January' WHEN 2 THEN 'February' WHEN 3 THEN 'March'
-            WHEN 4 THEN 'April'   WHEN 5 THEN 'May'      WHEN 6 THEN 'June'
-            WHEN 7 THEN 'July'    WHEN 8 THEN 'August'   WHEN 9 THEN 'September'
-            WHEN 10 THEN 'October' WHEN 11 THEN 'November' WHEN 12 THEN 'December'
-        END AS month_name
-    FROM datamart.cal_days cal
-    WHERE cal.date < date_trunc('year', CURRENT_DATE + interval '1 year')::date
+ML AS (
+    SELECT
+        date_trunc('day', (ml.effective_from_time::timestamptz AT TIME ZONE 'Australia/Perth') - interval '6 hours')::date AS production_day,
+        ml.material_lot_id, ml.material_definition_id,
+        ml.effective_from_time, ml.effective_to_time,
+        ml.qty AS actual_quantity,
+        ml.record_time, ml.source_system,
+        li2O.value AS liO2,
+        '' AS operational_location,
+        t.value AS contrib
+    FROM current_records_sk ml
+    LEFT JOIN dw.property t    ON t.entity_sk = ml.material_lot_sk AND t.key = 'Contributor'
+    LEFT JOIN dw.property li2o ON li2o.entity_sk = ml.material_lot_sk AND li2o.id = 'Li2O'
+    WHERE ml.material_definition_id IN ('Contaminated ROM','ROM','Core Hole')
 ),
 metrics AS (
-    SELECT date_trunc('day', b.end_time - interval '18 hours')::date AS production_day,
-        b.operational_location,
+    SELECT b.production_day, b.operational_location,
         CASE
-            WHEN b.operational_location like 'OSP%'                                                THEN 'OSP'
-            WHEN b.work_master_id = 'Dev Extraction'  AND b.dest_material_definition_id = 'ROM'    THEN 'Development Ore'
-            WHEN b.work_master_id = 'Prod Extraction' AND b.dest_material_definition_id = 'ROM'    THEN 'Production Ore'
-            WHEN b.work_master_id = 'Dev Extraction'  OR  b.work_master_id = 'Prod Extraction'
-             AND b.dest_material_definition_id = 'Waste'                                            THEN 'Waste'
+            WHEN b.operational_location like 'OSP%'                                              THEN 'Haulage OSP'
+            WHEN b.work_master_id = 'Dev Extraction' AND b.dest_material_definition_id = 'ROM'   THEN 'Haulage Development Ore'
+            WHEN b.work_master_id = 'Prod Extraction' AND b.dest_material_definition_id = 'ROM'  THEN 'Haulage Production Ore'
+            WHEN b.dest_material_definition_id = 'Waste'                                         THEN 'Waste'
             ELSE NULL
         END AS metric,
         b.actual_quantity AS metric_value
     FROM base b WHERE b.work_master_id IN ('Dev Extraction','Prod Extraction')
     UNION ALL
-    SELECT date_trunc('day', d.end_time - interval '18 hours')::date, d.operational_location,
+    SELECT d.production_day, d.operational_location,
         CASE
             WHEN d.dev_type = 'Cap Dec' THEN 'Decline'
             WHEN d.dev_type = 'Op Lat'  THEN 'Operating'
@@ -124,7 +156,7 @@ metrics AS (
         END, d.value
     FROM ddrilling d
     UNION ALL
-    SELECT date_trunc('day', p.end_time - interval '18 hours')::date, p.operational_location,
+    SELECT p.production_day, p.operational_location,
         CASE
             WHEN p.drill_type = 'Prod' THEN 'Production Drilling'
             WHEN p.drill_type = 'Cap'  THEN 'Capital Drilling'
@@ -132,96 +164,49 @@ metrics AS (
         END, p.actual_quantity
     FROM pdrilling p
     UNION ALL
-    SELECT date_trunc('day', rb.end_time - interval '18 hours')::date, rb.operational_location,
+    SELECT rb.production_day, rb.operational_location,
         CASE WHEN rb.work_master_id = 'RaiseBore Drilling' THEN 'Rhino Rising' ELSE rb.work_master_id END,
         rb.actual_quantity
     FROM otherdrilling rb
     UNION ALL
-    SELECT date_trunc('day', b.end_time - interval '18 hours')::date, b.operational_location,
-        b.work_master_id, b.actual_quantity
+    SELECT b.production_day, b.operational_location, b.work_master_id, b.actual_quantity
     FROM base b WHERE b.work_master_id IN ('Dev Bogging','Sump Bogging','Prod Remote Bogging','ROM Rehandling','Prod Free Bogging','Roadworks')
     UNION ALL
-    SELECT date_trunc('day', b.end_time - interval '18 hours')::date, b.operational_location,
-        b.work_master_id, b.actual_quantity
+    SELECT b.production_day, b.operational_location, b.work_master_id, b.actual_quantity
     FROM base b WHERE b.work_master_id IN ('Dev Blasting','Prod Blasting')
     UNION ALL
-    SELECT date_trunc('day', b.end_time - interval '18 hours')::date, b.operational_location,
-        CASE WHEN b.work_master_id = 'Paste Filling' THEN 'Paste Pouring' ELSE b.work_master_id END, 
+    SELECT b.production_day, b.operational_location,
+        CASE WHEN b.work_master_id = 'Paste Filling' THEN 'Paste Pouring' ELSE b.work_master_id END,
         b.actual_quantity
     FROM base b WHERE b.work_master_id IN ('Paste Filling')
-     -- Production Ore Li Mass (ROM, PROD) — used to derive weighted grade
     UNION ALL
-    SELECT
-        date_trunc('day', ml.effective_to_time - interval '18 hours')::date,
-        ml.operational_location,
-        'Production Ore Li Mass',
-        (ml.liO2::numeric / 100.0) * ml.actual_quantity
-    FROM ML ml
-    WHERE ml.material_definition_id = 'ROM'
-      AND upper(trim(ml.contrib)) = 'PROD'
-      AND ml.liO2 IS NOT NULL
+    SELECT ml.production_day, ml.operational_location,
+        'Production Ore Li Mass', (ml.liO2::numeric / 100.0) * ml.actual_quantity
+    FROM ML ml WHERE ml.material_definition_id = 'ROM' AND upper(trim(ml.contrib)) = 'PROD' AND ml.liO2 IS NOT NULL
     UNION ALL
-    -- Development Ore Li Mass (ROM, DEV)
-    SELECT
-        date_trunc('day', ml.effective_to_time - interval '18 hours')::date,
-        ml.operational_location,
-        'Development Ore Li Mass',
-        (ml.liO2::numeric / 100.0) * ml.actual_quantity
-    FROM ML ml
-    WHERE ml.material_definition_id = 'ROM'
-      AND upper(trim(ml.contrib)) = 'DEV'
-      AND ml.liO2 IS NOT NULL
+    SELECT ml.production_day, ml.operational_location,
+        'Development Ore Li Mass', (ml.liO2::numeric / 100.0) * ml.actual_quantity
+    FROM ML ml WHERE ml.material_definition_id = 'ROM' AND upper(trim(ml.contrib)) = 'DEV' AND ml.liO2 IS NOT NULL
     UNION ALL
-    -- OSP Li Mass (Contaminated ROM)
-    SELECT
-        date_trunc('day', ml.effective_to_time - interval '18 hours')::date,
-        ml.operational_location,
-        'OSP Li Mass',
-        (ml.liO2::numeric / 100.0) * ml.actual_quantity
-    FROM ML ml
-    WHERE ml.material_definition_id = 'Contaminated ROM'
-      AND ml.liO2 IS NOT NULL
+    SELECT ml.production_day, ml.operational_location,
+        'OSP Li Mass', (ml.liO2::numeric / 100.0) * ml.actual_quantity
+    FROM ML ml WHERE ml.material_definition_id = 'Contaminated ROM' AND ml.liO2 IS NOT NULL
     UNION ALL
-    -- Diamond Drilling quantity (Core Hole)
-    SELECT
-        date_trunc('day', ml.effective_to_time - interval '18 hours')::date,
-        ml.operational_location,
-        'Diamond Drilling',
-        ml.actual_quantity
-    FROM ML ml
-    WHERE ml.material_definition_id = 'Core Hole'
+    SELECT ml.production_day, ml.operational_location,
+        'Diamond Drilling', ml.actual_quantity
+    FROM ML ml WHERE ml.material_definition_id = 'Core Hole'
     UNION ALL
-    -- Production Ore Geology tonnes (denominator for grade)
-    SELECT
-        date_trunc('day', ml.effective_to_time - interval '18 hours')::date,
-        ml.operational_location,
-        'Production Ore Geology',
-        ml.actual_quantity
-    FROM ML ml
-    WHERE ml.material_definition_id = 'ROM'
-      AND upper(trim(ml.contrib)) = 'PROD'
-      AND ml.liO2 IS NOT NULL        -- same filter as Li Mass so they're consistent
+    SELECT ml.production_day, ml.operational_location,
+        'Production Ore', ml.actual_quantity
+    FROM ML ml WHERE ml.material_definition_id = 'ROM' AND upper(trim(ml.contrib)) = 'PROD'
     UNION ALL
-    -- Development Ore Geology tonnes
-    SELECT
-        date_trunc('day', ml.effective_to_time - interval '18 hours')::date,
-        ml.operational_location,
-        'Development Ore Geology',
-        ml.actual_quantity
-    FROM ML ml
-    WHERE ml.material_definition_id = 'ROM'
-      AND upper(trim(ml.contrib)) = 'DEV'
-      AND ml.liO2 IS NOT NULL
+    SELECT ml.production_day, ml.operational_location,
+        'Development Ore', ml.actual_quantity
+    FROM ML ml WHERE ml.material_definition_id = 'ROM' AND upper(trim(ml.contrib)) = 'DEV'
     UNION ALL
-    -- OSP Geology tonnes
-    SELECT
-        date_trunc('day', ml.effective_to_time - interval '18 hours')::date,
-        ml.operational_location,
-        'OSP Geology',
-        ml.actual_quantity
-    FROM ML ml
-    WHERE ml.material_definition_id = 'Contaminated ROM'
-      AND ml.liO2 IS NOT NULL
+    SELECT ml.production_day, ml.operational_location,
+        'OSP', ml.actual_quantity
+    FROM ML ml WHERE ml.material_definition_id = 'Contaminated ROM'
 ),
 daily_metrics AS (
     SELECT production_day, metric, SUM(metric_value) AS daily_value
@@ -232,7 +217,7 @@ final AS (
     SELECT production_day, metric, daily_value FROM daily_metrics
     UNION ALL
     SELECT production_day, 'Total Ore Hauled', SUM(daily_value)
-    FROM daily_metrics WHERE metric IN ('Development Ore','Production Ore', 'OSP') GROUP BY production_day
+    FROM daily_metrics WHERE metric IN ('Development Ore','Production Ore','OSP') GROUP BY production_day
     UNION ALL
     SELECT production_day, 'Total Haulage', SUM(daily_value)
     FROM daily_metrics WHERE metric IN ('Development Ore','Production Ore','Waste','OSP') GROUP BY production_day
@@ -243,172 +228,78 @@ final AS (
     SELECT production_day, 'Total Development', SUM(daily_value)
     FROM daily_metrics WHERE metric IN ('Decline','Capital','Operating') GROUP BY production_day
     UNION ALL
-    -- NEW: actual Li Mass total, mirrors planned side
     SELECT production_day, 'Total Li Mass', SUM(daily_value)
-    FROM daily_metrics
-    WHERE metric IN ('Production Ore Li Mass','Development Ore Li Mass','OSP Li Mass')
-    GROUP BY production_day
-        UNION ALL
-    SELECT production_day, 'Total Ore Geology', SUM(daily_value)
-    FROM daily_metrics
-    WHERE metric IN ('Production Ore Geology','Development Ore Geology','OSP Geology')
-    GROUP BY production_day
-),
-metric_list AS (
-    -- Section header rows: uom = '' is the header flag, fractional order places them first in each group
-    SELECT 'Hauling'             AS metric,  5.5  AS metric_order, ''      AS uom
-    UNION ALL SELECT 'Development',           14.5,                 ''
-    UNION ALL SELECT 'Drilling',             .5,                    ''
-    UNION ALL SELECT 'Backfill',             18.5,                ''
-    -- Hauling
-    UNION ALL SELECT 'Production Ore',        6,                   't'
-    UNION ALL SELECT 'Production Ore Grade',  7,                   '%'
-    UNION ALL SELECT 'Development Ore',       8,                   't'
-    UNION ALL SELECT 'Development Ore Grade', 9,                   '%'
-    UNION ALL SELECT 'Total Ore Hauled',      10,                   't'
-     UNION ALL SELECT 'Total Ore Grade',      10.5,                   '%'
-    UNION ALL SELECT 'OSP',                   11,                   't'
-    UNION ALL SELECT 'OSP Grade',             12,                   '%'
-    UNION ALL SELECT 'Waste',                 13,                   't'
-    UNION ALL SELECT 'Total Haulage',         14,                   't'
-    -- Development
-    UNION ALL SELECT 'Decline',              15,                   'm'
-    UNION ALL SELECT 'Capital',             16,                   'm'
-    UNION ALL SELECT 'Operating',           17,                   'm'
-    UNION ALL SELECT 'Total Development',   18,                   'm'
-    -- Drilling
-    UNION ALL SELECT 'Production Drilling', 1,                   'm'
-    UNION ALL SELECT 'Capital Drilling',    2,                   'm'
-    UNION ALL SELECT 'Total Longhole',      3,                   'm'
-    UNION ALL SELECT 'Rhino Rising',        4,                   'm'
-    UNION ALL SELECT 'Diamond Drilling',    5,                   'm'
-    UNION ALL SELECT 'Paste Pouring',       19,                   'm3'
-    UNION ALL SELECT 'Dev Bogging',         20,                   't'
-    UNION ALL SELECT 'Sump Bogging',        21,                   't'
-    UNION ALL SELECT 'Prod Remote Bogging', 22,                   't'
-    UNION ALL SELECT 'ROM Rehandling',      23,                   't'
-    UNION ALL SELECT 'Prod Free Bogging',   24,                   't'
-    UNION ALL SELECT 'Roadworks',           25,                   'm'
-    UNION ALL SELECT 'Prod Blasting',       26,                   't'
-    UNION ALL SELECT 'Dev Blasting',        27,                   't'
-    UNION ALL SELECT 'Development Ore Li Mass',   28,                   't'
-    UNION ALL SELECT 'Production Ore Li Mass',           25,                   't'
-    UNION ALL SELECT 'OSP Li Mass',       26,                   't'
-    UNION ALL SELECT 'Total Li Mass',        27,                   't'
-    UNION ALL SELECT 'Production Ore Geology',   98,  't'
-    UNION ALL SELECT 'Development Ore Geology',  99,  't'
-    UNION ALL SELECT 'OSP Geology',             100,  't'
-    UNION ALL SELECT 'Total Ore Geology',       101,  't'
-),
-calendar_metrics AS (
-    SELECT
-        c.date, c.day, c.month, c.year, c.month_name,
-        make_date(c.year, c.month, 1)                          AS month_date,
-        to_char(make_date(c.year, c.month, 1), 'FMMonth YYYY') AS month_year,
-        ml.metric, ml.metric_order, ml.uom
-    FROM calendar c
-    CROSS JOIN metric_list ml
+    FROM daily_metrics WHERE metric IN ('Production Ore Li Mass','Development Ore Li Mass','OSP Li Mass') GROUP BY production_day
+    UNION ALL
+    SELECT production_day, 'Haulage Total Ore Hauled', SUM(daily_value)
+    FROM daily_metrics WHERE metric IN ('Haulage Development Ore','Haulage Production Ore','Haulage OSP') GROUP BY production_day
 ),
 day_wtd_mtd AS (
     SELECT
         cm.date AS production_day,
-        cm.month, cm.year, cm.day, cm.month_name, cm.month_date, cm.month_year,
+        cm.month, cm.year, cm.day,
         cm.metric, cm.uom, cm.metric_order,
-        -- Last 24hr: NULL for headers, raw daily value for data rows
-        CASE WHEN cm.uom = '' THEN NULL
-             ELSE COALESCE(f.daily_value, 0)
-        END AS "Last 24hr",
-        -- WTD: weighted avg for grades, simple cumulative sum for everything else
-        sum
-        (CASE
-           WHEN cm.uom = '' THEN NULL 
-           ELSE COALESCE(f.daily_value, 0) END) OVER wtd_win
-        AS "WTD",
-        -- MTD
-        sum
-        (CASE
-            WHEN cm.uom = '' THEN NULL 
-            ELSE COALESCE(f.daily_value, 0) END) OVER mtd_win
-        AS "MTD",
-        -- YTD
-        sum 
-        (CASE
-            WHEN cm.uom = '' THEN NULL 
-        ELSE COALESCE(f.daily_value, 0) END) OVER ytd_win
-        AS "YTD"
+        CASE WHEN cm.uom = '' THEN NULL ELSE COALESCE(f.daily_value, 0) END AS "Last 24hr",
+        CASE WHEN cm.date > CURRENT_DATE THEN NULL
+             ELSE sum(CASE WHEN cm.uom = '' THEN NULL ELSE COALESCE(f.daily_value, 0) END) OVER wtd_win
+        END AS "WTD",
+        CASE WHEN cm.date > CURRENT_DATE THEN NULL
+             ELSE sum(CASE WHEN cm.uom = '' THEN NULL ELSE COALESCE(f.daily_value, 0) END) OVER mtd_win
+        END AS "MTD"
     FROM calendar_metrics cm
-    LEFT JOIN final f
-        ON  f.production_day = cm.date AND f.metric = cm.metric
+    LEFT JOIN final f ON f.production_day = cm.date AND f.metric = cm.metric
     WINDOW
         wtd_win AS (
-            PARTITION BY cm.metric,
-                         (date_trunc('week', cm.date - interval '3 days') + interval '3 days')
+            PARTITION BY cm.metric, (date_trunc('week', cm.date - interval '3 days') + interval '3 days')
             ORDER BY cm.date ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
         ),
         mtd_win AS (
             PARTITION BY cm.metric, date_trunc('month', cm.date)
             ORDER BY cm.date ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-        ),
-        ytd_win AS (
-            PARTITION BY cm.metric, date_trunc('year', cm.date)
-            ORDER BY cm.date ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
         )
     ORDER BY cm.date DESC, cm.metric_order
 ),
 actuals_withgrades AS (
-    -- All non-grade rows pass through unchanged (Li Mass rows included — still visible in output)
     SELECT * FROM day_wtd_mtd
-    WHERE metric NOT IN (
-        'Production Ore Grade',
-        'Development Ore Grade',
-        'OSP Grade',
-        'Total Ore Grade'
-    )
+    WHERE metric NOT IN ('Production Ore Grade','Development Ore Grade','OSP Grade','Total Ore Grade')
     UNION ALL
-    -- Grade rows: Li Mass accumulated value divided by matching tonne accumulated value * 100
     SELECT
-        lm.production_day,
-        lm.month, lm.year, lm.day,
-        lm.month_name, lm.month_date, lm.month_year,
+        lm.production_day, lm.month, lm.year, lm.day,
         CASE lm.metric
             WHEN 'Production Ore Li Mass'  THEN 'Production Ore Grade'
             WHEN 'Development Ore Li Mass' THEN 'Development Ore Grade'
             WHEN 'OSP Li Mass'             THEN 'OSP Grade'
-            WHEN 'Total Li Mass'       THEN 'Total Ore Grade'
-        END                                                        AS metric,
-        '%'                                                        AS uom,
+            WHEN 'Total Li Mass'           THEN 'Total Ore Grade'
+        END AS metric,
+        '%'  AS uom,
         CASE lm.metric
             WHEN 'Production Ore Li Mass'  THEN 7.0
             WHEN 'Development Ore Li Mass' THEN 9.0
             WHEN 'OSP Li Mass'             THEN 12.0
-            WHEN 'Total Li Mass'       THEN 10.5
-        END                                                        AS metric_order,
+            WHEN 'Total Li Mass'           THEN 10.5
+        END  AS metric_order,
         ROUND(lm."Last 24hr" / NULLIF(t."Last 24hr", 0) * 100, 2) AS "Last 24hr",
         ROUND(lm."WTD"       / NULLIF(t."WTD",       0) * 100, 2) AS "WTD",
-        ROUND(lm."MTD"       / NULLIF(t."MTD",       0) * 100, 2) AS "MTD",
-        ROUND(lm."YTD"       / NULLIF(t."YTD",       0) * 100, 2) AS "YTD"
+        ROUND(lm."MTD"       / NULLIF(t."MTD",       0) * 100, 2) AS "MTD"
     FROM day_wtd_mtd lm
     LEFT JOIN LATERAL (
-        SELECT a2."Last 24hr", a2."WTD", a2."MTD", a2."YTD"
+        SELECT a2."Last 24hr", a2."WTD", a2."MTD"
         FROM day_wtd_mtd a2
         WHERE a2.production_day = lm.production_day
           AND a2.metric = CASE lm.metric
-              WHEN 'Production Ore Li Mass'  THEN 'Production Ore Geology'
-              WHEN 'Development Ore Li Mass' THEN 'Development Ore Geology'
-              WHEN 'OSP Li Mass'             THEN 'OSP Geology'
-              WHEN 'Total Li Mass'           THEN 'Total Ore Geology'
+              WHEN 'Production Ore Li Mass'  THEN 'Production Ore'
+              WHEN 'Development Ore Li Mass' THEN 'Development Ore'
+              WHEN 'OSP Li Mass'             THEN 'OSP'
+              WHEN 'Total Li Mass'           THEN 'Total Ore Hauled'
           END
     ) t ON true
-    WHERE lm.metric IN (
-        'Production Ore Li Mass',
-        'Development Ore Li Mass',
-        'OSP Li Mass',
-        'Total Li Mass'
-    )
+    WHERE lm.metric IN ('Production Ore Li Mass','Development Ore Li Mass','OSP Li Mass','Total Li Mass')
 ),
--- retrieve the lastest schedule version
- latest_work_schedule AS (
- SELECT DISTINCT ON (work_schedule_id) *
+-- -------------------------------------------------------
+-- Weekly schedule
+-- -------------------------------------------------------
+latest_work_schedule AS (
+    SELECT DISTINCT ON (work_schedule_id) *
     FROM dw.work_schedule
     ORDER BY work_schedule_id, record_time DESC
 ),
@@ -422,7 +313,7 @@ material_requirement_sch AS (
     FROM dw.material_requirement mr
     LEFT JOIN dw.job_order jo    ON mr.entity_sk = jo.job_order_sk
     LEFT JOIN dw.work_request wr ON jo.entity_sk = wr.work_request_sk
-    LEFT JOIN  latest_work_schedule ws ON wr.work_schedule_sk = ws.work_schedule_sk
+    LEFT JOIN latest_work_schedule ws ON wr.work_schedule_sk = ws.work_schedule_sk
     WHERE jo.work_master_id IN ('Extraction','Dev Drilling','Prod Drilling','RaiseBore Drilling','Diamond Drilling','Paste Filling')
 ),
 params AS (
@@ -452,10 +343,8 @@ MR_base AS (
         ON t.entity_sk = p.material_requirement_sk AND t.id = 'Type'
     LEFT JOIN dw.property li2o
         ON li2o.entity_sk = p.material_requirement_sk AND li2o.id = 'Li2O'
-    WHERE p.storage_location IS NOT NULL
 ),
 planned_raw AS (
-    -- Extraction: tonne metrics
     SELECT b.start_time, b.end_time, b.storage_location, b.active, b.priority,
         CASE
             WHEN b.haul_type = 'OSP'      THEN 'OSP'
@@ -463,8 +352,7 @@ planned_raw AS (
             WHEN b.haul_type = 'Prod Ore' THEN 'Production Ore'
             WHEN b.haul_type = 'Waste'    THEN 'Waste'
             ELSE NULL
-        END AS metric,
-        b.qty
+        END AS metric, b.qty
     FROM MR_base b WHERE b.work_master_id = 'Extraction'
     UNION ALL
     SELECT b.start_time, b.end_time, b.storage_location, b.active, b.priority,
@@ -475,78 +363,62 @@ planned_raw AS (
             ELSE NULL
         END AS metric,
         (b.haul_grade::numeric / 100.0) * b.qty::numeric AS qty
-    FROM MR_base b 
-    WHERE b.work_master_id = 'Extraction'
-    AND b.haul_grade IS NOT NULL
+    FROM MR_base b WHERE b.work_master_id = 'Extraction' AND b.haul_grade IS NOT NULL
     UNION ALL
-    -- Dev Drilling
     SELECT d.start_time, d.end_time, d.storage_location, d.active, d.priority,
         CASE
             WHEN d.dev_type = 'Cap Dec' THEN 'Decline'
             WHEN d.dev_type = 'Op Lat'  THEN 'Operating'
             WHEN d.dev_type = 'Cap Lat' THEN 'Capital'
             ELSE NULL
-        END AS metric,
-        d.dev_advance::numeric AS qty
+        END AS metric, d.dev_advance::numeric AS qty
     FROM MR_base d WHERE d.work_master_id = 'Dev Drilling'
     UNION ALL
-    --Prod Drilling
     SELECT p.start_time, p.end_time, p.storage_location, p.active, p.priority,
         CASE
             WHEN p.drill_type = 'Prod' THEN 'Production Drilling'
             WHEN p.drill_type = 'Cap'  THEN 'Capital Drilling'
             ELSE NULL
-        END AS metric,
-        p.qty
-    FROM MR_base p
+        END AS metric, p.qty
+    FROM MR_base p WHERE p.work_master_id = 'Prod Drilling'
     UNION ALL
     SELECT rb.start_time, rb.end_time, rb.storage_location, rb.active, rb.priority,
-        CASE 
-            WHEN rb.work_master_id = 'RaiseBore Drilling' THEN 'Rhino Rising' 
-            ELSE rb.work_master_id 
-        END as metric,
+        CASE WHEN rb.work_master_id = 'RaiseBore Drilling' THEN 'Rhino Rising' ELSE rb.work_master_id END AS metric,
         rb.qty
-    FROM MR_base rb
+    FROM MR_base rb WHERE rb.work_master_id = 'RaiseBore Drilling'
     UNION ALL
     SELECT rb.start_time, rb.end_time, rb.storage_location, rb.active, rb.priority,
-        CASE 
-            WHEN rb.work_master_id = 'Paste Filling' THEN 'Paste Pouring' 
-            ELSE rb.work_master_id 
-        END as metric,
+        CASE WHEN rb.work_master_id = 'Paste Filling' THEN 'Paste Pouring' ELSE rb.work_master_id END AS metric,
         rb.qty
-    FROM MR_base rb
+    FROM MR_base rb WHERE rb.work_master_id = 'Paste Filling'
 ),
 planned_daily AS (
     SELECT
         day_series::date AS production_day,
-        pr.start_time AS week_start,pr.metric,
+        pr.start_time    AS week_start,
+        pr.metric,
         pr.qty / NULLIF(
-            (date_trunc('day', pr.end_time)::date
-           - date_trunc('day', pr.start_time)::date), 0
+            date_trunc('day', (pr.end_time::timestamptz   AT TIME ZONE 'Australia/Perth') - INTERVAL '6 hours')::date
+          - date_trunc('day', (pr.start_time::timestamptz AT TIME ZONE 'Australia/Perth') - INTERVAL '6 hours')::date, 0
         ) AS daily_plan
     FROM planned_raw pr
     CROSS JOIN LATERAL generate_series(
-        date_trunc('day', pr.start_time)::timestamp,
-        date_trunc('day', pr.end_time)::timestamp - INTERVAL '1 day',
+        date_trunc('day', (pr.start_time::timestamptz AT TIME ZONE 'Australia/Perth') - INTERVAL '6 hours')::timestamp,
+        date_trunc('day', (pr.end_time::timestamptz   AT TIME ZONE 'Australia/Perth') - INTERVAL '6 hours')::timestamp - INTERVAL '1 day',
         INTERVAL '1 day'
     ) AS day_series
     WHERE pr.metric IS NOT NULL
 ),
 planned_daily_agg AS (
-    SELECT
-        pd.production_day,
-        pd.week_start,
-        pd.metric,
-        SUM(pd.daily_plan)          AS daily_plan
+    SELECT pd.production_day, pd.week_start, pd.metric, SUM(pd.daily_plan) AS daily_plan
     FROM planned_daily pd
     GROUP BY pd.production_day, pd.week_start, pd.metric
 ),
 planned_final AS (
-    SELECT production_day, metric, daily_plan, week_start
-    FROM planned_daily_agg
+    SELECT production_day, metric, daily_plan, week_start FROM planned_daily_agg
     UNION ALL
     SELECT production_day, 'Total Ore Hauled', SUM(daily_plan), week_start
-    FROM planned_daily_agg WHERE metric IN ('Development Ore','Production Ore', 'OSP') GROUP BY production_day, week_start
+    FROM planned_daily_agg WHERE metric IN ('Development Ore','Production Ore','OSP') GROUP BY production_day, week_start
     UNION ALL
     SELECT production_day, 'Total Haulage', SUM(daily_plan), week_start
     FROM planned_daily_agg WHERE metric IN ('Development Ore','Production Ore','Waste','OSP') GROUP BY production_day, week_start
@@ -558,65 +430,147 @@ planned_final AS (
     FROM planned_daily_agg WHERE metric IN ('Decline','Capital','Operating') GROUP BY production_day, week_start
     UNION ALL
     SELECT production_day, 'Total Li Mass', SUM(daily_plan), week_start
-    FROM planned_daily_agg WHERE metric IN ('Development Ore Li Mass','Production Ore Li Mass', 'OSP Li Mass') GROUP BY production_day, week_start
+    FROM planned_daily_agg WHERE metric IN ('Development Ore Li Mass','Production Ore Li Mass','OSP Li Mass') GROUP BY production_day, week_start
+),
+-- -------------------------------------------------------
+-- 3MS Operations Schedule Plan
+-- -------------------------------------------------------
+latest_3ms_schedule AS (
+    SELECT DISTINCT ON (operations_schedule_id) *
+    FROM dw.operations_schedule
+    ORDER BY operations_schedule_id, record_time DESC
+),
+ops_sch_3ms AS (
+    SELECT
+        mr.material_use, mr.material_definition_ids[1] AS material_definition_id,
+        mr.material_requirement_sk, mr.storage_location, ws.operations_schedule_id,
+        sr.earliest_start_time AS start_time, sr.latest_end_time AS end_time,
+        sr.process_segment_id AS work_master_id, sr.segment_requirement_sk,
+        qa.key, COALESCE(qa.value_num, 0) AS qty, qa.uom AS UoM
+    FROM dw.segment_requirement sr
+    LEFT JOIN dw.material_requirement mr ON mr.entity_sk = sr.segment_requirement_sk
+    LEFT JOIN dw.operations_request wr ON sr.operations_request_sk = wr.operations_request_sk
+    JOIN latest_3ms_schedule ws ON wr.operations_schedule_sk = ws.operations_schedule_sk
+    LEFT JOIN dw.quantity qa ON qa.entity_sk = mr.material_requirement_sk
+    WHERE sr.process_segment_id IN ('Extraction','Drilling','RaiseBore Drilling','Diamond Drilling','Paste Filling')
+),
+"3ms_base" AS (
+    SELECT
+        date_trunc('day', (p.start_time::timestamptz AT TIME ZONE 'Australia/Perth') - INTERVAL '6 hours')::date AS production_day,
+        p.operations_schedule_id,
+        p.material_requirement_sk, p.material_definition_id, p.key,
+        p.work_master_id, p.material_use, p.storage_location, p.qty, p.uom,
+        prop.value AS haul_grade
+    FROM ops_sch_3ms p
+    LEFT JOIN dw.property prop ON p.material_requirement_sk = prop.entity_sk
+        AND prop.id = CASE p.key
+            WHEN 'Dev Ore Tonnes'  THEN 'Dev Ore Li2O Grade'
+            WHEN 'OSP Tonnes'      THEN 'OSP Grade'
+            WHEN 'Prod Ore Tonnes' THEN 'Prod Ore Li2O Grade'
+        END
+),
+"3ms_raw" AS (
+    SELECT b.production_day, b.storage_location, b.operations_schedule_id,
+        CASE
+            WHEN b.key = 'OSP Tonnes'      THEN 'OSP'
+            WHEN b.key = 'Dev Ore Tonnes'  THEN 'Development Ore'
+            WHEN b.key = 'Prod Ore Tonnes' THEN 'Production Ore'
+            WHEN b.key = 'Waste'           THEN 'Waste'
+            ELSE NULL
+        END AS metric, b.qty
+    FROM "3ms_base" b WHERE b.work_master_id = 'Extraction'
+    UNION ALL
+    SELECT b.production_day, b.storage_location, b.operations_schedule_id,
+        CASE
+            WHEN b.key = 'OSP Tonnes'      THEN 'OSP Li Mass'
+            WHEN b.key = 'Dev Ore Tonnes'  THEN 'Development Ore Li Mass'
+            WHEN b.key = 'Prod Ore Tonnes' THEN 'Production Ore Li Mass'
+            ELSE NULL
+        END AS metric,
+        (b.haul_grade::numeric / 100.0) * b.qty::numeric AS qty
+    FROM "3ms_base" b WHERE b.work_master_id = 'Extraction'
+    UNION ALL
+    SELECT d.production_day, d.storage_location, d.operations_schedule_id,
+        CASE
+            WHEN d.key = 'Cap Dec' THEN 'Decline'
+            WHEN d.key = 'Op Lat'  THEN 'Operating'
+            WHEN d.key = 'Cap Lat' THEN 'Capital'
+            ELSE NULL
+        END AS metric, d.qty
+    FROM "3ms_base" d WHERE d.work_master_id = 'Drilling'   
+    UNION ALL
+    SELECT p.production_day, p.storage_location, p.operations_schedule_id,
+        CASE
+            WHEN p.key = 'PRD MM STOPE' THEN 'Production Drilling'
+            WHEN p.key = 'PRD MM CAP'   THEN 'Capital Drilling'
+            ELSE NULL
+        END AS metric, p.qty
+    FROM "3ms_base" p WHERE p.work_master_id = 'Drilling'        
+    UNION ALL
+    SELECT rb.production_day, rb.storage_location, rb.operations_schedule_id,
+        CASE WHEN rb.key = 'Rhino Drilling' THEN 'Rhino Rising' ELSE NULL END AS metric,
+        rb.qty
+    FROM "3ms_base" rb WHERE rb.work_master_id = 'RaiseBore Drilling'
+    UNION ALL
+    SELECT fill.production_day, fill.storage_location, fill.operations_schedule_id,
+        CASE WHEN fill.key = 'Fill Volume' THEN 'Paste Pouring' ELSE NULL END AS metric,
+        fill.qty
+    FROM "3ms_base" fill WHERE fill.work_master_id = 'Paste Filling'
+),
+"3ms_daily_agg" AS (
+    SELECT production_day, metric, SUM(qty) AS daily_plan, MAX(operations_schedule_id) AS operations_schedule_id
+    FROM "3ms_raw" WHERE metric IS NOT NULL GROUP BY production_day, metric
+    UNION ALL
+    SELECT production_day, 'Total Ore Hauled', SUM(qty), MAX(operations_schedule_id)
+    FROM "3ms_raw" WHERE metric IN ('Development Ore','Production Ore','OSP') GROUP BY production_day
+    UNION ALL
+    SELECT production_day, 'Total Haulage', SUM(qty), MAX(operations_schedule_id)
+    FROM "3ms_raw" WHERE metric IN ('Development Ore','Production Ore','Waste','OSP') GROUP BY production_day
+    UNION ALL
+    SELECT production_day, 'Total Longhole', SUM(qty), MAX(operations_schedule_id)
+    FROM "3ms_raw" WHERE metric IN ('Production Drilling','Capital Drilling') GROUP BY production_day
+    UNION ALL
+    SELECT production_day, 'Total Development', SUM(qty), MAX(operations_schedule_id)
+    FROM "3ms_raw" WHERE metric IN ('Decline','Capital','Operating') GROUP BY production_day
+    UNION ALL
+    SELECT production_day, 'Total Li Mass', SUM(qty), MAX(operations_schedule_id)
+    FROM "3ms_raw" WHERE metric IN ('Development Ore Li Mass','Production Ore Li Mass','OSP Li Mass') GROUP BY production_day
+),
+"3ms_plan_mtd" AS (
+    SELECT
+        cm.date AS production_day,
+        cm.metric, cm.uom,
+        d.operations_schedule_id,
+        SUM(CASE WHEN cm.uom = '' THEN NULL ELSE COALESCE(d.daily_plan, 0) END)
+            OVER (
+                PARTITION BY cm.metric, date_trunc('month', cm.date)
+                ORDER BY cm.date ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+            ) AS "3ms Plan MTD"
+    FROM calendar_metrics cm
+    LEFT JOIN "3ms_daily_agg" d ON d.production_day = cm.date AND d.metric = cm.metric
 ),
 plan_wtd_mtd AS (
     SELECT
         cm.date AS production_day,
         cm.metric,
         pf.week_start,
-        CASE
-            WHEN cm.uom = '' THEN NULL
-            ELSE COALESCE(pf.daily_plan, 0)
-        END AS "Plan Last 24hr",
-        -- Plan WTD
-        sum
-        (CASE
-            WHEN  cm.uom = '' THEN NULL
-            ELSE COALESCE(pf.daily_plan, 0) END) OVER plan_wtd_win
-        AS "Plan WTD",
-        -- Plan MTD
-        sum
-        (CASE
-            WHEN cm.uom = '' THEN NULL 
-            ELSE COALESCE(pf.daily_plan, 0) END) OVER plan_mtd_win
-        AS "Plan MTD",
-        -- Plan YTD
-        sum
-        (CASE
-            WHEN cm.uom = '' THEN NULL 
-            ELSE COALESCE(pf.daily_plan, 0) END) OVER plan_ytd_win
-        AS "Plan YTD"
+        ms.operations_schedule_id,
+        CASE WHEN cm.uom = '' THEN NULL ELSE COALESCE(pf.daily_plan, 0) END AS "Plan Last 24hr",
+        sum(CASE WHEN cm.uom = '' THEN NULL ELSE COALESCE(pf.daily_plan, 0) END) OVER plan_wtd_win AS "Plan WTD",
+        ms."3ms Plan MTD" AS "Plan MTD"
     FROM calendar_metrics cm
-    LEFT JOIN planned_final pf
-        ON  pf.production_day = cm.date AND pf.metric = cm.metric
+    LEFT JOIN planned_final pf  ON pf.production_day = cm.date AND pf.metric = cm.metric
+    LEFT JOIN "3ms_plan_mtd" ms ON ms.production_day = cm.date AND ms.metric = cm.metric
     WINDOW
         plan_wtd_win AS (
-            PARTITION BY cm.metric,
-                         (date_trunc('week', cm.date - INTERVAL '3 days') + INTERVAL '3 days')
-            ORDER BY cm.date ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-        ),
-        plan_mtd_win AS (
-            PARTITION BY cm.metric, date_trunc('month', cm.date)
-            ORDER BY cm.date ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-        ),
-        plan_ytd_win AS (
-            PARTITION BY cm.metric, date_trunc('year', cm.date)
+            PARTITION BY cm.metric, (date_trunc('week', cm.date - INTERVAL '3 days') + INTERVAL '3 days')
             ORDER BY cm.date ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
         )
 ),
 planned_withgrades AS (
-    -- All non-grade rows pass through unchanged
     SELECT * FROM plan_wtd_mtd
-    WHERE metric NOT IN (
-        'Production Ore Grade',
-        'Development Ore Grade',
-        'OSP Grade',
-        'Waste Grade',
-        'Total Ore Grade'
-    )
+    WHERE metric NOT IN ('Production Ore Grade','Development Ore Grade','OSP Grade','Waste Grade','Total Ore Grade')
     UNION ALL
-    -- Grade rows: for each Li Mass row, lateral-lookup the matching tonne row
     SELECT
         lm.production_day,
         CASE lm.metric
@@ -627,17 +581,13 @@ planned_withgrades AS (
             WHEN 'Total Li Mass'           THEN 'Total Ore Grade'
         END AS metric,
         lm.week_start,
+        lm.operations_schedule_id,
         ROUND(lm."Plan Last 24hr" / NULLIF(t."Plan Last 24hr", 0) * 100, 2) AS "Plan Last 24hr",
         ROUND(lm."Plan WTD"       / NULLIF(t."Plan WTD",       0) * 100, 2) AS "Plan WTD",
-        ROUND(lm."Plan MTD"       / NULLIF(t."Plan MTD",       0) * 100, 2) AS "Plan MTD",
-        ROUND(lm."Plan YTD"       / NULLIF(t."Plan YTD",       0) * 100, 2) AS "Plan YTD"
+        ROUND(lm."Plan MTD"       / NULLIF(t."Plan MTD",       0) * 100, 2) AS "Plan MTD"
     FROM plan_wtd_mtd lm
     LEFT JOIN LATERAL (
-        SELECT
-            p2."Plan Last 24hr",
-            p2."Plan WTD",
-            p2."Plan MTD",
-            p2."Plan YTD"
+        SELECT p2."Plan Last 24hr", p2."Plan WTD", p2."Plan MTD"
         FROM plan_wtd_mtd p2
         WHERE p2.production_day = lm.production_day
           AND p2.metric = CASE lm.metric
@@ -648,67 +598,44 @@ planned_withgrades AS (
               WHEN 'Total Li Mass'           THEN 'Total Ore Hauled'
           END
     ) t ON true
-    WHERE lm.metric IN (
-        'Production Ore Li Mass',
-        'Development Ore Li Mass',
-        'OSP Li Mass',
-        'Waste Li Mass',
-        'Total Li Mass'
-    )
+    WHERE lm.metric IN ('Production Ore Li Mass','Development Ore Li Mass','OSP Li Mass','Waste Li Mass','Total Li Mass')
 )
 SELECT
     a.production_day,
     a.month, a.year, a.day,
     p.week_start,
-    a.month_name, a.month_date, a.month_year,
+    p.operations_schedule_id,
     a.metric,
     a.metric_order,
     a.uom,
-    -- NEW: formatting flag — use in QuickSight conditional formatting rules
+    CASE a.month
+        WHEN 1  THEN 'January'   WHEN 2  THEN 'February' WHEN 3  THEN 'March'
+        WHEN 4  THEN 'April'     WHEN 5  THEN 'May'      WHEN 6  THEN 'June'
+        WHEN 7  THEN 'July'      WHEN 8  THEN 'August'   WHEN 9  THEN 'September'
+        WHEN 10 THEN 'October'   WHEN 11 THEN 'November' WHEN 12 THEN 'December'
+    END AS month_name,
     CASE
-        WHEN a.metric IN ('Hauling','Development','Drilling', 'Backfill')
-            THEN 'Section Header'   
-        WHEN a.metric IN ('Total Haulage','Total Development','Total Longhole','Total Ore Hauled')
-            THEN 'Total'           
+        WHEN a.metric IN ('Hauling','Development','Drilling','Backfill')                                                     THEN 'Section Header'
+        WHEN a.metric IN ('Total Haulage','Total Development','Total Longhole','Total Ore Hauled','Haulage Total Ore Hauled') THEN 'Total'
         ELSE 'Normal'
     END AS display_style,
-    -- Raw numeric actuals (keep for colour logic)
-    a."Last 24hr", a."WTD", a."MTD", a."YTD",
-    p."Plan Last 24hr", p."Plan WTD", p."Plan MTD", p."Plan YTD",
-    -- Raw numeric variances
+    a."Last 24hr", a."WTD", a."MTD",
+    p."Plan Last 24hr", p."Plan WTD", p."Plan MTD",
     a."Last 24hr" - COALESCE(p."Plan Last 24hr", 0) AS "Var Last 24hr",
     a."WTD"       - COALESCE(p."Plan WTD",        0) AS "Var WTD",
     a."MTD"       - COALESCE(p."Plan MTD",        0) AS "Var MTD",
-    -- Colour flags
-    CASE
-        WHEN a."Last 24hr" > COALESCE(p."Plan Last 24hr", 0) THEN 'Above Plan'
-        WHEN a."Last 24hr" < COALESCE(p."Plan Last 24hr", 0) THEN 'Below Plan'
-        ELSE 'On Target'
-    END AS "Var Last 24hr Color",
-    CASE
-        WHEN a."WTD" > COALESCE(p."Plan WTD", 0) THEN 'Above Plan'
-        WHEN a."WTD" < COALESCE(p."Plan WTD", 0) THEN 'Below Plan'
-        ELSE 'On Target'
-    END AS "Var WTD Color",
-    CASE
-        WHEN a."MTD" > COALESCE(p."Plan MTD", 0) THEN 'Above Plan'
-        WHEN a."MTD" < COALESCE(p."Plan MTD", 0) THEN 'Below Plan'
-        ELSE 'On Target'
-    END AS "Var MTD Color",
-    -- Formatted display columns (grade 2dp, integers comma-separated)
-    TO_CHAR(a."Last 24hr",                                    CASE WHEN a.metric LIKE '%Grade%' THEN 'FM999990.00' ELSE 'FM999,999,990' END) AS "Last 24hr Display",
-    TO_CHAR(a."WTD",                                          CASE WHEN a.metric LIKE '%Grade%' THEN 'FM999990.00' ELSE 'FM999,999,990' END) AS "WTD Display",
-    TO_CHAR(a."MTD",                                          CASE WHEN a.metric LIKE '%Grade%' THEN 'FM999990.00' ELSE 'FM999,999,990' END) AS "MTD Display",
-    TO_CHAR(a."YTD",                                          CASE WHEN a.metric LIKE '%Grade%' THEN 'FM999990.00' ELSE 'FM999,999,990' END) AS "YTD Display",
-    TO_CHAR(p."Plan Last 24hr",                               CASE WHEN a.metric LIKE '%Grade%' THEN 'FM999990.00' ELSE 'FM999,999,990' END) AS "Plan Last 24hr Display",
-    TO_CHAR(p."Plan WTD",                                     CASE WHEN a.metric LIKE '%Grade%' THEN 'FM999990.00' ELSE 'FM999,999,990' END) AS "Plan WTD Display",
-    TO_CHAR(p."Plan MTD",                                     CASE WHEN a.metric LIKE '%Grade%' THEN 'FM999990.00' ELSE 'FM999,999,990' END) AS "Plan MTD Display",
-    TO_CHAR(p."Plan YTD",                                     CASE WHEN a.metric LIKE '%Grade%' THEN 'FM999990.00' ELSE 'FM999,999,990' END) AS "Plan YTD Display",
-    TO_CHAR(a."Last 24hr" - COALESCE(p."Plan Last 24hr", 0), CASE WHEN a.metric LIKE '%Grade%' THEN 'FM999990.00' ELSE 'FM999,999,990' END) AS "Var Last 24hr Display",
+    CASE WHEN a."Last 24hr" > COALESCE(p."Plan Last 24hr", 0) THEN 'Above Plan' WHEN a."Last 24hr" < COALESCE(p."Plan Last 24hr", 0) THEN 'Below Plan' ELSE 'On Target' END AS "Var Last 24hr Color",
+    CASE WHEN a."WTD"       > COALESCE(p."Plan WTD",        0) THEN 'Above Plan' WHEN a."WTD"       < COALESCE(p."Plan WTD",        0) THEN 'Below Plan' ELSE 'On Target' END AS "Var WTD Color",
+    CASE WHEN a."MTD"       > COALESCE(p."Plan MTD",        0) THEN 'Above Plan' WHEN a."MTD"       < COALESCE(p."Plan MTD",        0) THEN 'Below Plan' ELSE 'On Target' END AS "Var MTD Color",
+    TO_CHAR(a."Last 24hr",                                     CASE WHEN a.metric LIKE '%Grade%' THEN 'FM999990.00' ELSE 'FM999,999,990' END) AS "Last 24hr Display",
+    TO_CHAR(a."WTD",                                           CASE WHEN a.metric LIKE '%Grade%' THEN 'FM999990.00' ELSE 'FM999,999,990' END) AS "WTD Display",
+    TO_CHAR(a."MTD",                                           CASE WHEN a.metric LIKE '%Grade%' THEN 'FM999990.00' ELSE 'FM999,999,990' END) AS "MTD Display",
+    TO_CHAR(p."Plan Last 24hr",                                CASE WHEN a.metric LIKE '%Grade%' THEN 'FM999990.00' ELSE 'FM999,999,990' END) AS "Plan Last 24hr Display",
+    TO_CHAR(p."Plan WTD",                                      CASE WHEN a.metric LIKE '%Grade%' THEN 'FM999990.00' ELSE 'FM999,999,990' END) AS "Plan WTD Display",
+    TO_CHAR(p."Plan MTD",                                      CASE WHEN a.metric LIKE '%Grade%' THEN 'FM999990.00' ELSE 'FM999,999,990' END) AS "Plan MTD Display",
+    TO_CHAR(a."Last 24hr" - COALESCE(p."Plan Last 24hr", 0),  CASE WHEN a.metric LIKE '%Grade%' THEN 'FM999990.00' ELSE 'FM999,999,990' END) AS "Var Last 24hr Display",
     TO_CHAR(a."WTD"       - COALESCE(p."Plan WTD",        0), CASE WHEN a.metric LIKE '%Grade%' THEN 'FM999990.00' ELSE 'FM999,999,990' END) AS "Var WTD Display",
     TO_CHAR(a."MTD"       - COALESCE(p."Plan MTD",        0), CASE WHEN a.metric LIKE '%Grade%' THEN 'FM999990.00' ELSE 'FM999,999,990' END) AS "Var MTD Display"
 FROM planned_withgrades p
-LEFT JOIN actuals_withgrades a        -- ← was day_wtd_mtd
-    ON  p.production_day = a.production_day
-    AND p.metric         = a.metric
-ORDER BY a.production_day DESC, a.metric_order
+LEFT JOIN actuals_withgrades a ON p.production_day = a.production_day AND p.metric = a.metric
+ORDER BY a.production_day DESC
