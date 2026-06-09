@@ -102,12 +102,12 @@ pdrilling AS (
     WHERE b.work_master_id = 'Prod Drilling' AND b.key ilike 'holelength'
     ORDER BY b.end_time DESC
 ),
-otherdrilling AS (
+rising AS (
     SELECT
         b.production_day, b.work_master_id, b.operational_location,
         b.material_use, b.actual_quantity
     FROM base b
-    JOIN datamart.property p ON  b.job_response_sk = p.parent_entity_sk AND p.value ilike '%boxcut%'
+    JOIN datamart.property p ON  b.job_response_sk = p.parent_entity_sk AND p.value ilike '%boxhole%'
     WHERE b.work_master_id IN ('RaiseBore Drilling') AND b.key ilike 'holelength'
     ORDER BY b.end_time DESC
 ),
@@ -131,8 +131,8 @@ ML AS (
         '' AS operational_location,
         t.value AS contrib
     FROM current_records_sk ml
-    LEFT JOIN dw.property t    ON t.entity_sk = ml.material_lot_sk AND t.key = 'Contributor'
-    LEFT JOIN dw.property li2o ON li2o.entity_sk = ml.material_lot_sk AND li2o.id = 'Li2O'
+    LEFT JOIN datamart.property t    ON t.parent_entity_sk = ml.material_lot_sk AND t.key = 'Contributor'
+    LEFT JOIN datamart.property li2o ON li2o.parent_entity_sk = ml.material_lot_sk AND li2o.property_id = 'Li2O'
     WHERE ml.material_definition_id IN ('Contaminated ROM','ROM','Core Hole')
 ),
 metrics AS (
@@ -167,7 +167,7 @@ metrics AS (
     SELECT rb.production_day, rb.operational_location,
         CASE WHEN rb.work_master_id = 'RaiseBore Drilling' THEN 'Rhino Rising' ELSE rb.work_master_id END,
         rb.actual_quantity
-    FROM otherdrilling rb
+    FROM rising rb
     UNION ALL
     SELECT b.production_day, b.operational_location, b.work_master_id, b.actual_quantity
     FROM base b WHERE b.work_master_id IN ('Dev Bogging','Sump Bogging','Prod Remote Bogging','ROM Rehandling','Prod Free Bogging','Roadworks')
@@ -339,10 +339,10 @@ MR_base AS (
         li2o.unit_of_measure
     FROM material_requirement_sch p
     LEFT JOIN params pa    ON pa.entity_sk = p.job_order_sk
-    LEFT JOIN dw.property t
-        ON t.entity_sk = p.material_requirement_sk AND t.id = 'Type'
-    LEFT JOIN dw.property li2o
-        ON li2o.entity_sk = p.material_requirement_sk AND li2o.id = 'Li2O'
+    LEFT JOIN datamart.property t
+        ON t.parent_entity_sk = p.material_requirement_sk AND t.property_id = 'Type'
+    LEFT JOIN datamart.property li2o
+        ON li2o.parent_entity_sk = p.material_requirement_sk AND li2o.property_id = 'Li2O'
 ),
 planned_raw AS (
     SELECT b.start_time, b.end_time, b.storage_location, b.active, b.priority,
@@ -462,8 +462,8 @@ ops_sch_3ms AS (
         p.work_master_id, p.material_use, p.storage_location, p.qty, p.uom,
         prop.value AS haul_grade
     FROM ops_sch_3ms p
-    LEFT JOIN dw.property prop ON p.material_requirement_sk = prop.entity_sk
-        AND prop.id = CASE p.key
+    LEFT JOIN datamart.property prop ON p.material_requirement_sk = prop.parent_entity_sk
+        AND prop.property_id = CASE p.key
             WHEN 'Dev Ore Tonnes'  THEN 'Dev Ore Li2O Grade'
             WHEN 'OSP Tonnes'      THEN 'OSP Grade'
             WHEN 'Prod Ore Tonnes' THEN 'Prod Ore Li2O Grade'
